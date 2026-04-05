@@ -1,86 +1,9 @@
 #!/usr/bin/env python3
-import json
+import argparse
+
 import requests
-import websocket
 
-BASE_URL = "https://cst.uf-tree.com"
-
-# 支持的浏览器 CDP 端口
-BROWSERS = [
-    {"name": "Edge", "port": 9223, "url": "http://localhost:9223/json"},
-    {"name": "Chrome", "port": 18800, "url": "http://localhost:18800/json"},
-]
-
-
-def find_browser():
-    """自动检测可用的浏览器，优先返回包含财税通页面的浏览器"""
-    available = []
-    for browser in BROWSERS:
-        try:
-            pages = requests.get(browser["url"], timeout=6).json()
-            # 检查是否有财税通页面
-            has_cst = any("cst.uf-tree.com" in p.get("url", "") for p in pages)
-            available.append({**browser, "has_cst": has_cst})
-        except Exception:
-            continue
-
-    if not available:
-        return None
-
-    # 优先返回有财税通页面的浏览器
-    for b in available:
-        if b["has_cst"]:
-            return b
-
-    # 如果都没有财税通页面，返回第一个可用的
-    return available[0]
-
-
-def get_auth():
-    browser = find_browser()
-    if not browser:
-        raise RuntimeError("未检测到可用的浏览器。请按以下步骤操作：\n"
-                          "1. 打开 Edge 浏览器:\n"
-                          "   /Applications/Microsoft\\ Edge.app/Contents/MacOS/Microsoft\\ Edge --remote-debugging-port=9223 --remote-allow-origins=*\n"
-                          "2. 或打开 Chrome 浏览器:\n"
-                          "   /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=18800 --remote-allow-origins=*\n"
-                          "3. 登录 https://cst.uf-tree.com")
-
-    if not browser["has_cst"]:
-        raise RuntimeError(f"{browser['name']} 中未发现财税通页面，请先登录 https://cst.uf-tree.com")
-
-    print(f"✅ 检测到 {browser['name']} 浏览器 (端口 {browser['port']})")
-
-    pages = requests.get(browser["url"], timeout=10).json()
-    ws_url = None
-    for p in pages:
-        if "cst.uf-tree.com" in p.get("url", ""):
-            ws_url = p.get("webSocketDebuggerUrl")
-            break
-    if not ws_url:
-        raise RuntimeError(f"未找到财税通页面（浏览器：{browser['name']}），请先登录并保持浏览器打开")
-
-    ws = websocket.create_connection(ws_url, timeout=10, suppress_origin=True)
-    ws.send(json.dumps({
-        "id": 1,
-        "method": "Runtime.evaluate",
-        "params": {"expression": "localStorage.getItem('vuex')", "returnByValue": True}
-    }))
-
-    value = None
-    for _ in range(10):
-        msg = json.loads(ws.recv())
-        if msg.get("id") == 1:
-            value = msg.get("result", {}).get("result", {}).get("value")
-            break
-    ws.close()
-
-    if not value:
-        raise RuntimeError("读取登录态失败")
-    data = json.loads(value)
-    token = data["user"]["token"]
-    company_id = data["user"]["company"]["id"]
-    return token, company_id
+from browser_session import BASE_URL, get_auth
 
 
 def check_get(url, headers, params, name):
@@ -100,8 +23,27 @@ def check_post(url, headers, payload, name):
 
 
 if __name__ == "__main__":
-    token, company_id = get_auth()
+    parser = argparse.ArgumentParser(description="财税通环境预检查")
+    parser.add_argument("--auto-login", action="store_true", help="登录态失效时自动打开浏览器并登录")
+    parser.add_argument("--username", help="财税通登录手机号；不传则优先读取 CST_USERNAME，仍缺失时终端提示输入")
+    parser.add_argument("--company-id", type=int, help="多企业账号时指定 companyId；也可用环境变量 CST_COMPANY_ID")
+    parser.add_argument(
+        "--browser",
+        choices=["auto", "edge", "chrome"],
+        default="auto",
+        help="优先使用的浏览器",
+    )
+    args = parser.parse_args()
+
+    token, company_id, _, browser_name = get_auth(
+        auto_login=args.auto_login,
+        preferred_browser=args.browser,
+        username=args.username,
+        company_id=args.company_id,
+        prompt=args.auto_login,
+    )
     headers = {"x-token": token, "Content-Type": "application/json"}
+    print(f"✅ 检测到 {browser_name} 浏览器")
     print(f"✅ 登录态可读: companyId={company_id}")
 
     checks = [
