@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from browser_session import BASE_URL, get_auth
+from browser_session import BASE_URL, get_auth, ui_save_bill_template
 
 
 def is_ok(resp):
@@ -361,7 +361,15 @@ def main():
         "step1": {"ok": 0, "fail": []},
         "step2": {"relations_ok": 0, "relations_fail": [], "role_by_doc": {}, "leaf_by_doc": {}},
         "step25": {},
-        "step3": {"ok": 0, "fail": [], "branch_fee_role": [], "branch_leaf_fee": [], "branch_skip": []},
+        "step3": {
+            "ok": 0,
+            "fail": [],
+            "branch_fee_role": [],
+            "branch_leaf_fee": [],
+            "branch_skip": [],
+            "ui_save_ok": [],
+            "ui_save_fail": [],
+        },
     }
 
     # Base maps
@@ -762,6 +770,7 @@ def main():
 
     type_map = {"报销单": "EXPENSE", "借款单": "LOAN", "批量付款单": "PAYMENT", "申请单": "REQUISITION"}
 
+    created_docs = []
     for _, row in df3.iterrows():
         group_name = str(row.get(get_col(df3, "单据分组（一级目录）"), "")).strip()
         doc_type = str(row.get(get_col(df3, "单据大类（二级目录）"), "")).strip()
@@ -829,8 +838,30 @@ def main():
         cr = requests.post(f"{BASE_URL}/api/bill/template/createTemplate", headers=h, json=payload, timeout=15).json()
         if cr.get("code") == 200 and cr.get("success"):
             report["step3"]["ok"] += 1
+            created_docs.append(doc_name)
         else:
             report["step3"]["fail"].append({"doc": doc_name, "message": cr.get("message")})
+
+    if created_docs:
+        print("\n7️⃣ 页面保存闭环...")
+        for idx, doc_name in enumerate(created_docs):
+            try:
+                save_result = ui_save_bill_template(
+                    doc_name,
+                    preferred_browser=args.browser,
+                    reload_page=(idx == 0),
+                )
+                report["step3"]["ui_save_ok"].append(
+                    {
+                        "doc": doc_name,
+                        "message": save_result.get("message"),
+                        "templateId": save_result.get("templateId"),
+                    }
+                )
+                print(f"   ✅ 已页面保存：{doc_name}")
+            except Exception as exc:
+                report["step3"]["ui_save_fail"].append({"doc": doc_name, "message": str(exc)})
+                print(f"   ❌ 页面保存失败：{doc_name} -> {exc}")
 
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print("✅ 导入完成")

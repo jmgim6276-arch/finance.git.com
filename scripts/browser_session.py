@@ -148,7 +148,7 @@ def ensure_cst_page(browser, url=LOGIN_URL):
     raise RuntimeError(f"{browser['name']} 未能打开财税通页面")
 
 
-def cdp_eval(page, expression, return_by_value=True):
+def cdp_eval(page, expression, return_by_value=True, await_promise=False):
     ws = websocket.create_connection(
         page["webSocketDebuggerUrl"],
         timeout=10,
@@ -163,6 +163,7 @@ def cdp_eval(page, expression, return_by_value=True):
                     "params": {
                         "expression": expression,
                         "returnByValue": return_by_value,
+                        "awaitPromise": await_promise,
                     },
                 }
             )
@@ -175,6 +176,14 @@ def cdp_eval(page, expression, return_by_value=True):
             return result.get("value") if return_by_value else result
     finally:
         ws.close()
+    return None
+
+
+def get_page_by_url(browser, url_substring):
+    pages = list_pages(browser)
+    for page in pages:
+        if url_substring in page.get("url", ""):
+            return page
     return None
 
 
@@ -201,6 +210,43 @@ def cdp_navigate(page, url):
     finally:
         ws.close()
     return None
+
+
+def ensure_bill_template_page(browser, reload_page=False):
+    bill_url = f"{BASE_URL}/bill/bills"
+    page = get_page_by_url(browser, "/bill/bills")
+    if not page:
+        open_target(browser, bill_url)
+        time.sleep(1)
+        page = get_page_by_url(browser, "/bill/bills")
+    if not page:
+        raise RuntimeError("未能打开单据模板页面")
+
+    if reload_page:
+        cdp_navigate(page, bill_url)
+
+    def _ready():
+        raw = cdp_eval(
+            page,
+            """
+            (() => JSON.stringify({
+              href: location.href,
+              ready: !!(document.querySelector('#app') && document.querySelector('#app').__vue__)
+            }))()
+            """,
+        )
+        try:
+            info = json.loads(raw or "{}")
+        except Exception:
+            return None
+        if info.get("href", "").endswith("/bill/bills") and info.get("ready"):
+            return page
+        return None
+
+    ready_page = wait_for(_ready, timeout=20, interval=1)
+    if not ready_page:
+        raise RuntimeError("单据模板页面未就绪")
+    return ready_page
 
 
 def get_vuex_raw(page):
@@ -406,6 +452,197 @@ def ensure_company_selected(page, desired_company_id=None):
     if not selected:
         raise RuntimeError("企业选择后未能读取到有效 companyId")
     return selected
+
+
+def ui_save_bill_template_on_page(page, doc_name):
+    def _tree_ready():
+        raw = cdp_eval(
+            page,
+            """
+            (() => {
+              function findVm(vm, predicate) {
+                if (!vm) return null;
+                if (predicate(vm)) return vm;
+                for (const child of (vm.$children || [])) {
+                  const found = findVm(child, predicate);
+                  if (found) return found;
+                }
+                return null;
+              }
+              const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+              const billsVm = findVm(root, vm => vm.$options && vm.$options.methods && typeof vm.$options.methods.fnClickBillItem === 'function');
+              const tree = billsVm && billsVm.$store && billsVm.$store.state && billsVm.$store.state.bills
+                ? (billsVm.$store.state.bills.tmplTreeData || [])
+                : [];
+              return JSON.stringify({ ready: tree.length > 0, count: tree.length });
+            })()
+            """,
+        )
+        try:
+            info = json.loads(raw or "{}")
+        except Exception:
+            return None
+        return info if info.get("ready") else None
+
+    if not wait_for(_tree_ready, timeout=20, interval=1):
+        raise RuntimeError("单据模板树未加载完成")
+
+    open_result = cdp_eval(
+        page,
+        f"""
+        (() => {{
+          function findVm(vm, predicate) {{
+            if (!vm) return null;
+            if (predicate(vm)) return vm;
+            for (const child of (vm.$children || [])) {{
+              const found = findVm(child, predicate);
+              if (found) return found;
+            }}
+            return null;
+          }}
+          function findItem(nodes, name) {{
+            for (const node of (nodes || [])) {{
+              const nodeName = node.name || node.title || '';
+              if (nodeName === name) return node;
+              const found = findItem(node.children || [], name);
+              if (found) return found;
+            }}
+            return null;
+          }}
+          const targetName = {json.dumps(doc_name, ensure_ascii=False)};
+          const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+          if (!root) return JSON.stringify({{ ok: false, reason: 'vue-root-not-found' }});
+          const billsVm = findVm(root, vm => vm.$options && vm.$options.methods && typeof vm.$options.methods.fnClickBillItem === 'function');
+          if (!billsVm || !billsVm.$store) return JSON.stringify({{ ok: false, reason: 'bills-component-not-found' }});
+          const tree = (((billsVm.$store || {{}}).state || {{}}).bills || {{}}).tmplTreeData || [];
+          const item = findItem(tree, targetName);
+          if (!item) return JSON.stringify({{ ok: false, reason: 'template-not-found' }});
+          billsVm.fnClickBillItem(item, true);
+          return JSON.stringify({{ ok: true, id: item.id, name: item.name || item.title }});
+        }})()
+        """,
+    )
+    open_info = json.loads(open_result or "{}")
+    if not open_info.get("ok"):
+        raise RuntimeError(f"打开模板失败：{open_info}")
+
+    template_id = open_info.get("id")
+    template_name = open_info.get("name")
+
+    def _opened():
+        raw = cdp_eval(
+            page,
+            """
+            (() => {
+              function findVm(vm, predicate) {
+                if (!vm) return null;
+                if (predicate(vm)) return vm;
+                for (const child of (vm.$children || [])) {
+                  const found = findVm(child, predicate);
+                  if (found) return found;
+                }
+                return null;
+              }
+              const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+              const billsVm = findVm(root, vm => vm.$options && vm.$options.methods && typeof vm.$options.methods.fnClickBillItem === 'function');
+              const store = billsVm && billsVm.$store;
+              const bill = store && store.state && store.state.bills ? store.state.bills.bill : null;
+              return JSON.stringify({
+                id: bill ? bill.id : null,
+                name: bill ? bill.name : null
+              });
+            })()
+            """,
+        )
+        try:
+            info = json.loads(raw or "{}")
+        except Exception:
+            return None
+        if info.get("id") == template_id and info.get("name") == template_name:
+            return info
+        return None
+
+    if not wait_for(_opened, timeout=20, interval=1):
+        raise RuntimeError(f"模板打开后未加载完成：{doc_name}")
+
+    save_result = cdp_eval(
+        page,
+        """
+        (async () => {
+          function findVm(vm, predicate) {
+            if (!vm) return null;
+            if (predicate(vm)) return vm;
+            for (const child of (vm.$children || [])) {
+              const found = findVm(child, predicate);
+              if (found) return found;
+            }
+            return null;
+          }
+          const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+          if (!root) return JSON.stringify({ ok: false, reason: 'vue-root-not-found' });
+          const ctrlVm = findVm(root, vm => vm.$options && vm.$options.methods
+            && typeof vm.$options.methods.fnBsnAddTmpl === 'function'
+            && typeof vm.$options.methods.fnNetUBill === 'function');
+          if (!ctrlVm) return JSON.stringify({ ok: false, reason: 'save-control-not-found' });
+          await ctrlVm.fnBsnAddTmpl('ACTIVE');
+          return JSON.stringify({ ok: true });
+        })()
+        """,
+        await_promise=True,
+    )
+    save_info = json.loads(save_result or "{}")
+    if not save_info.get("ok"):
+        raise RuntimeError(f"执行页面保存失败：{save_info}")
+
+    def _message():
+        raw = cdp_eval(
+            page,
+            """
+            (() => JSON.stringify(
+              [...document.querySelectorAll('.el-message, .ivu-message')]
+                .map(el => ({
+                  text: (el.innerText || el.textContent || '').trim(),
+                  cls: el.className || ''
+                }))
+            ))()
+            """,
+        )
+        try:
+            messages = json.loads(raw or "[]")
+        except Exception:
+            return None
+        for message in messages:
+            text = message.get("text", "")
+            if "成功" in text:
+                return {"ok": True, "message": text}
+            if "失败" in text or "错误" in text:
+                return {"ok": False, "message": text}
+        return None
+
+    result = wait_for(_message, timeout=8, interval=0.5)
+    if result is None:
+        return {
+            "ok": True,
+            "templateId": template_id,
+            "templateName": template_name,
+            "message": "页面已触发保存",
+        }
+    if not result.get("ok"):
+        raise RuntimeError(f"页面保存提示失败：{result.get('message')}")
+    return {
+        "ok": True,
+        "templateId": template_id,
+        "templateName": template_name,
+        "message": result.get("message"),
+    }
+
+
+def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False):
+    browser = find_browser(preferred=preferred_browser, require_cst=True)
+    if not browser:
+        raise RuntimeError("未找到已登录的财税通浏览器页面，无法执行页面保存")
+    page = ensure_bill_template_page(browser, reload_page=reload_page)
+    return ui_save_bill_template_on_page(page, doc_name)
 
 
 def ensure_login(
