@@ -14,9 +14,22 @@
 ## 2) 一键执行
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 scripts/preflight_check.py
 python3 scripts/import_from_agent1.py --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" --output "./agent2_import_report.json"
 ```
+
+## 2.5) 新设备快速开始
+
+```bash
+git clone https://github.com/jmgim6276-arch/finance.git.com.git
+cd finance.git.com
+python3 -m pip install -r requirements.txt
+python3 scripts/preflight_check.py
+```
+
+- 如果你在 macOS 上使用系统自带 Python，看见 `urllib3` 的 LibreSSL 提示通常不影响脚本执行
+- 如果你想让环境更稳，优先使用 Homebrew 或 python.org 安装的 Python 3.9+
 
 ## 3) 成功标准（小白版）
 
@@ -34,8 +47,7 @@ python3 scripts/import_from_agent1.py --xlsx "/path/to/三表联动_客户模板
 
 ## 5) 先看这两份文档
 
-- `references/作战说明书-小白版.md`
-- `references/故障排查速查卡.md`
+- `references/README.md`
 
 ## 6) 关键边界（必须遵守）
 

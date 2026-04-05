@@ -9,8 +9,9 @@ Run this skill to execute system import directly from Agent1 output (`01_添加�
 
 ## Execute
 
-1. Run preflight first:
+1. Install dependencies and run preflight first:
 ```bash
+python3 -m pip install -r requirements.txt
 python3 scripts/preflight_check.py
 ```
 
@@ -42,7 +43,4 @@ python3 scripts/import_from_agent1.py \
 
 ## Read References When Needed
 
-- Newbie operation: `references/小白执行手册.md`
-- Field and boundary rules: `references/字段与边界速查.md`
-- Full battle playbook: `references/作战说明书-小白版.md`
-- Troubleshooting quick card: `references/故障排查速查卡.md`
+- Repo placeholder note: `references/README.md`
