@@ -869,24 +869,15 @@ def main():
             payload["applyContentType"] = "TEXT"
 
         # 费用限制分支
-        # 优先判断是否有费用角色（基于单据适配人员）
-        if has_people.get(doc_name, False) and report["step2"]["role_by_doc"].get(doc_name):
-            # 有单据适配人员：使用费用角色限制
-            fee_role_ids = report["step2"]["role_by_doc"][doc_name]
-            # 设置费用角色限制
+        # 只有当单据已成功匹配到费用角色且角色里有人时，才勾选“限制费用类型”
+        fee_role_ids = report["step2"]["role_by_doc"].get(doc_name, [])
+        if has_people.get(doc_name, False) and fee_role_ids:
             payload["feeRoleIds"] = fee_role_ids
             payload["feeScopeFlag"] = True
             report["step3"]["branch_fee_role"].append({"doc": doc_name, "feeRoleIds": fee_role_ids})
-        elif payload["type"] in ("LOAN", "REQUISITION"):
-            # 借款单/申请单：不限制费用
-            report["step3"]["branch_skip"].append(doc_name)
         else:
-            # 无单据适配人员：使用费用科目直接限制（如果有）
-            fee_ids = report["step2"]["leaf_by_doc"].get(doc_name, [])
-            if fee_ids:
-                payload["feeIds"] = fee_ids
-                payload["feeScopeFlag"] = True
-            report["step3"]["branch_leaf_fee"].append({"doc": doc_name, "feeIds": fee_ids})
+            # 没有费用角色人员时，不勾选“限制费用类型”
+            report["step3"]["branch_skip"].append(doc_name)
 
         cr = requests.post(f"{BASE_URL}/api/bill/template/createTemplate", headers=h, json=payload, timeout=15).json()
         if cr.get("code") == 200 and cr.get("success"):
