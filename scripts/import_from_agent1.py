@@ -873,6 +873,8 @@ def main():
         fee_role_ids = report["step2"]["role_by_doc"].get(doc_name, [])
         if has_people.get(doc_name, False) and fee_role_ids:
             payload["feeRoleIds"] = fee_role_ids
+            payload["feeScopeType"] = "FEE_ROLE"
+            payload["feeIds"] = []
             payload["feeScopeFlag"] = True
             report["step3"]["branch_fee_role"].append({"doc": doc_name, "feeRoleIds": fee_role_ids})
         else:
