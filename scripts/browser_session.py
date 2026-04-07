@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from copy import deepcopy
 import getpass
 import hashlib
 import json
@@ -31,6 +32,526 @@ BROWSERS = [
         "profile_dir": str(Path.home() / ".finance-cst" / "chrome-cdp-profile"),
     },
 ]
+
+STATIC_DEFAULT_BILL_MODELS = {
+    "EXPENSE": {
+        "businessType": "PRIVATE",
+        "icon": "md-pricetag",
+        "iconColor": "#4c7cc3",
+        "type": "EXPENSE",
+        "applyContentType": "FILLINTHESUM",
+        "applyRelateFlag": True,
+        "applyRelateNecessary": False,
+        "requestScope": False,
+        "payFlag": True,
+        "feeScopeFlag": False,
+        "componentJson": [
+            {
+                "id": 1,
+                "name": "title",
+                "label": "标题",
+                "type": "j-text",
+                "disableDel": True,
+                "props": {
+                    "min": 0,
+                    "max": 14,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 1,
+                    "placeholder": "请输入标题",
+                    "title": "标题",
+                    "required": True,
+                },
+            },
+            {
+                "id": 2,
+                "name": "submitter",
+                "label": "提交人",
+                "type": "j-submitter",
+                "disableDel": True,
+                "props": {
+                    "placeholder": "请选择提交人",
+                    "title": "提交人",
+                    "defaultValueType": 1,
+                    "required": True,
+                },
+            },
+            {
+                "id": 3,
+                "name": "expenseTime",
+                "label": "报销日期",
+                "type": "j-date",
+                "disableDel": True,
+                "props": {
+                    "defaultValueType": 1,
+                    "placeholder": "请选择报销日期",
+                    "canEdit": True,
+                    "title": "报销日期",
+                    "required": True,
+                    "needInputTime": False,
+                },
+            },
+            {
+                "name": "shop",
+                "id": 20,
+                "label": "公司",
+                "type": "j-shop",
+                "disableDel": True,
+                "props": {
+                    "canEdit": True,
+                    "placeholder": "请选择公司",
+                    "defaultValueType": 1,
+                    "title": "公司",
+                    "required": True,
+                },
+            },
+            {
+                "name": "applyDepartment",
+                "id": 12,
+                "label": "报销部门",
+                "type": "j-dept",
+                "props": {
+                    "scopeType": 1,
+                    "defaultValue": 1,
+                    "canEdit": True,
+                    "placeholder": "请选择报销部门",
+                    "defaultValueType": 1,
+                    "title": "报销部门",
+                    "required": False,
+                },
+            },
+            {
+                "name": "describe",
+                "id": 32,
+                "label": "描述",
+                "type": "j-text",
+                "props": {
+                    "min": 0,
+                    "max": 140,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 2,
+                    "placeholder": "请输入描述信息",
+                    "title": "描述",
+                    "required": False,
+                },
+            },
+            {
+                "id": 4,
+                "name": "feeDetails",
+                "label": "费用明细",
+                "type": "j-fee-details",
+                "disableDel": True,
+                "props": {
+                    "required": True,
+                },
+            },
+            {
+                "id": 6,
+                "name": "receiveAccount",
+                "label": "收款信息",
+                "disableDel": True,
+                "type": "j-account",
+                "props": {
+                    "required": True,
+                    "title": "收款信息",
+                    "placeholder": "请选择收款信息",
+                    "defaultValueType": 1,
+                },
+            },
+            {
+                "id": 7,
+                "name": "linkRequest",
+                "label": "关联申请",
+                "type": "j-request-bill",
+                "disableDel": True,
+                "props": {
+                    "required": False,
+                    "title": "关联申请",
+                    "placeholder": "请选择关联申请单",
+                    "defaultValueType": 1,
+                },
+            },
+        ],
+    },
+    "PAYMENT": {
+        "businessType": "PRIVATE",
+        "icon": "md-pricetag",
+        "iconColor": "#4c7cc3",
+        "type": "PAYMENT",
+        "applyContentType": "FILLINTHESUM",
+        "applyRelateFlag": True,
+        "applyRelateNecessary": False,
+        "requestScope": False,
+        "payFlag": True,
+        "feeScopeFlag": False,
+        "componentJson": [
+            {
+                "id": 1,
+                "name": "title",
+                "label": "标题",
+                "type": "j-text",
+                "disableDel": True,
+                "props": {
+                    "min": 0,
+                    "max": 14,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 1,
+                    "placeholder": "请输入标题",
+                    "title": "标题",
+                    "required": True,
+                },
+            },
+            {
+                "id": 2,
+                "name": "submitter",
+                "label": "提交人",
+                "type": "j-submitter",
+                "disableDel": True,
+                "props": {
+                    "placeholder": "请选择提交人",
+                    "title": "提交人",
+                    "defaultValueType": 1,
+                    "required": True,
+                },
+            },
+            {
+                "name": "shop",
+                "id": 20,
+                "label": "公司",
+                "type": "j-shop",
+                "disableDel": True,
+                "props": {
+                    "canEdit": True,
+                    "placeholder": "请选择公司",
+                    "defaultValueType": 1,
+                    "title": "公司",
+                    "required": True,
+                },
+            },
+            {
+                "id": 3,
+                "name": "expenseTime",
+                "label": "付款日期",
+                "type": "j-date",
+                "disableDel": False,
+                "props": {
+                    "defaultValueType": 1,
+                    "placeholder": "请选择付款日期",
+                    "canEdit": True,
+                    "title": "付款日期",
+                    "required": True,
+                    "needInputTime": False,
+                },
+            },
+            {
+                "name": "describe",
+                "id": 32,
+                "label": "描述",
+                "type": "j-text",
+                "props": {
+                    "min": 0,
+                    "max": 140,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 2,
+                    "placeholder": "请输入描述信息",
+                    "title": "描述",
+                    "required": False,
+                },
+            },
+            {
+                "id": 4,
+                "name": "feeDetails",
+                "label": "费用明细",
+                "type": "j-fee-details",
+                "disableDel": True,
+                "props": {
+                    "required": True,
+                },
+            },
+            {
+                "id": 71,
+                "name": "receiptAccount",
+                "label": "收款信息",
+                "disableDel": True,
+                "type": "j-receipt-account",
+                "props": {
+                    "required": True,
+                    "title": "收款信息",
+                    "placeholder": "请上传收款信息",
+                },
+            },
+        ],
+    },
+    "LOAN": {
+        "businessType": "PRIVATE",
+        "icon": "ios-paper",
+        "iconColor": "#FADB14",
+        "type": "LOAN",
+        "requestScope": False,
+        "payFlag": True,
+        "refundDateFlag": True,
+        "componentJson": [
+            {
+                "id": 1,
+                "name": "title",
+                "label": "标题",
+                "type": "j-text",
+                "disableDel": True,
+                "props": {
+                    "min": 0,
+                    "max": 14,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 1,
+                    "placeholder": "请输入标题",
+                    "title": "标题",
+                    "required": True,
+                },
+            },
+            {
+                "id": 2,
+                "name": "submitter",
+                "label": "提交人",
+                "type": "j-submitter",
+                "disableDel": True,
+                "props": {
+                    "placeholder": "请选择提交人",
+                    "title": "提交人",
+                    "defaultValueType": 1,
+                    "required": True,
+                },
+            },
+            {
+                "id": 3,
+                "name": "expenseTime",
+                "label": "借款日期",
+                "disableDel": True,
+                "type": "j-date",
+                "props": {
+                    "defaultValueType": 1,
+                    "placeholder": "请选择借款日期",
+                    "canEdit": True,
+                    "title": "借款日期",
+                    "required": False,
+                    "needInputTime": False,
+                },
+            },
+            {
+                "id": 5,
+                "name": "expensesAmount",
+                "label": "借款金额",
+                "type": "j-amount",
+                "disableDel": True,
+                "props": {
+                    "defaultValueType": 1,
+                    "title": "借款金额",
+                    "placeholder": "请输入借款金额",
+                    "required": True,
+                    "maxValue": 1000000,
+                    "minValue": 0.01,
+                    "showRmb": False,
+                },
+            },
+            {
+                "id": 6,
+                "name": "receiveAccount",
+                "label": "收款信息",
+                "disableDel": True,
+                "type": "j-account",
+                "props": {
+                    "required": True,
+                    "title": "收款信息",
+                    "placeholder": "请选择收款信息",
+                    "defaultValueType": 1,
+                },
+            },
+            {
+                "id": 8,
+                "name": "refundDate",
+                "label": "还款日期",
+                "disableDel": True,
+                "type": "j-date",
+                "props": {
+                    "defaultValueType": 2,
+                    "placeholder": "请选择还款日期",
+                    "canEdit": True,
+                    "title": "还款日期",
+                    "required": True,
+                    "needInputTime": False,
+                },
+            },
+            {
+                "name": "applyDepartment",
+                "id": 9,
+                "disableDel": True,
+                "label": "借款部门",
+                "type": "j-dept",
+                "props": {
+                    "scopeType": 1,
+                    "defaultValue": 1,
+                    "canEdit": True,
+                    "placeholder": "请选择借款部门",
+                    "defaultValueType": 1,
+                    "title": "借款部门",
+                    "required": False,
+                },
+            },
+            {
+                "name": "shop",
+                "id": 20,
+                "label": "公司",
+                "type": "j-shop",
+                "disableDel": True,
+                "props": {
+                    "canEdit": True,
+                    "placeholder": "请选择公司",
+                    "defaultValueType": 1,
+                    "title": "公司",
+                    "required": True,
+                },
+            },
+            {
+                "name": "describe",
+                "id": 32,
+                "label": "描述",
+                "type": "j-text",
+                "props": {
+                    "min": 0,
+                    "max": 140,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 2,
+                    "placeholder": "请输入描述信息",
+                    "title": "描述",
+                    "required": False,
+                },
+            },
+            {
+                "id": 33,
+                "name": "attachment",
+                "label": "附件",
+                "type": "j-attachment",
+                "props": {
+                    "title": "附件",
+                    "required": False,
+                },
+            },
+        ],
+    },
+    "REQUISITION": {
+        "businessType": "PRIVATE",
+        "icon": "md-plane",
+        "iconColor": "#FF7A45",
+        "type": "REQUISITION",
+        "applyContentType": "SUMFEE",
+        "feeScopeFlag": False,
+        "componentJson": [
+            {
+                "id": 1,
+                "name": "title",
+                "label": "标题",
+                "type": "j-text",
+                "disableDel": True,
+                "props": {
+                    "min": 0,
+                    "max": 14,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 1,
+                    "placeholder": "请输入标题",
+                    "title": "标题",
+                    "required": True,
+                },
+            },
+            {
+                "id": 2,
+                "name": "submitter",
+                "label": "提交人",
+                "type": "j-submitter",
+                "disableDel": True,
+                "props": {
+                    "placeholder": "请选择提交人",
+                    "title": "提交人",
+                    "defaultValueType": 1,
+                    "required": True,
+                },
+            },
+            {
+                "name": "shop",
+                "id": 20,
+                "label": "公司",
+                "type": "j-shop",
+                "disableDel": True,
+                "props": {
+                    "canEdit": True,
+                    "placeholder": "请选择公司",
+                    "defaultValueType": 1,
+                    "title": "公司",
+                    "required": True,
+                },
+            },
+            {
+                "id": 3,
+                "name": "expenseTime",
+                "label": "申请日期",
+                "type": "j-date",
+                "disableDel": True,
+                "props": {
+                    "defaultValueType": 1,
+                    "placeholder": "请选择申请日期",
+                    "canEdit": True,
+                    "title": "申请日期",
+                    "required": True,
+                    "needInputTime": False,
+                },
+            },
+            {
+                "name": "department",
+                "id": 30,
+                "label": "费用承担部门",
+                "type": "j-dept",
+                "props": {
+                    "scopeType": 1,
+                    "defaultValue": 1,
+                    "canEdit": True,
+                    "placeholder": "请选择费用承担部门",
+                    "defaultValueType": 1,
+                    "title": "费用承担部门",
+                    "required": False,
+                },
+            },
+            {
+                "name": "describe",
+                "id": 32,
+                "label": "描述",
+                "type": "j-text",
+                "props": {
+                    "min": 0,
+                    "max": 140,
+                    "defaultValue": "",
+                    "canEdit": True,
+                    "textType": 2,
+                    "placeholder": "请输入描述信息",
+                    "title": "描述",
+                    "required": False,
+                },
+            },
+            {
+                "id": 4,
+                "name": "feeDetails",
+                "label": "费用明细",
+                "type": "j-fee-details",
+                "disableDel": True,
+                "props": {
+                    "required": True,
+                },
+            },
+        ],
+    },
+}
 
 
 def is_ok(resp):
@@ -261,6 +782,37 @@ def open_fresh_bill_template_page(browser):
     return wait_for_bill_template_page(page)
 
 
+def get_static_default_bill_model(bill_type, group_id=0):
+    model = deepcopy(STATIC_DEFAULT_BILL_MODELS.get(str(bill_type or "").upper(), {}))
+    if model:
+        model["groupId"] = int(group_id or 0)
+        model["_source"] = "fallback"
+    return model
+
+
+def stabilize_default_bill_model(bill_type, model, group_id=0):
+    fallback = get_static_default_bill_model(bill_type, group_id=group_id)
+    if not model:
+        return fallback
+
+    merged = deepcopy(fallback)
+    for key, value in (model or {}).items():
+        if value is not None:
+            merged[key] = deepcopy(value)
+
+    if not merged.get("componentJson"):
+        merged["componentJson"] = deepcopy(fallback.get("componentJson") or [])
+
+    if group_id not in (None, ""):
+        merged["groupId"] = int(group_id or 0)
+
+    source = "browser"
+    if merged.get("componentJson") == fallback.get("componentJson") and model.get("componentJson") != fallback.get("componentJson"):
+        source = "browser+fallback"
+    merged["_source"] = source
+    return merged
+
+
 def get_default_bill_model_on_page(page, bill_type, group_id=0):
     raw = cdp_eval(
         page,
@@ -335,6 +887,9 @@ def get_default_bill_model_on_page(page, bill_type, group_id=0):
 def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False):
     browser = find_browser(preferred=preferred_browser, require_cst=True)
     if not browser:
+        fallback = get_static_default_bill_model(bill_type, group_id=group_id)
+        if fallback:
+            return fallback
         raise RuntimeError("未找到已登录的财税通浏览器页面，无法读取默认单据模型")
 
     errors = []
@@ -345,9 +900,15 @@ def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fres
         try:
             page = open_fresh_bill_template_page(browser) if use_fresh else ensure_bill_template_page(browser, reload_page=False)
             tried_existing = tried_existing or not use_fresh
-            return get_default_bill_model_on_page(page, bill_type=bill_type, group_id=group_id)
+            model = get_default_bill_model_on_page(page, bill_type=bill_type, group_id=group_id)
+            return stabilize_default_bill_model(bill_type, model, group_id=group_id)
         except Exception as exc:
             errors.append({"fresh_page": use_fresh, "message": str(exc)})
+
+    fallback = get_static_default_bill_model(bill_type, group_id=group_id)
+    if fallback:
+        fallback["_errors"] = errors
+        return fallback
     raise RuntimeError(f"读取默认单据模型失败：{errors}")
 
 

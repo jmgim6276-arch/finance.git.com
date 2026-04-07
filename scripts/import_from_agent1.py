@@ -296,10 +296,40 @@ def split_values(v):
     return [x.strip() for x in t.split(",") if x.strip()]
 
 
+def normalize_mobile(v):
+    t = re.sub(r"\D", "", "" if pd.isna(v) else str(v))
+    return t[:11] if t else ""
+
+
+def build_sheet_user_aliases(df1, users):
+    by_mobile = {}
+    for u in users:
+        uid = u.get("id")
+        if not uid:
+            continue
+        for key in ["mobile", "userName", "phone"]:
+            mobile = normalize_mobile(u.get(key))
+            if mobile and mobile not in by_mobile:
+                by_mobile[mobile] = u
+
+    alias_map = {}
+    for _, row in df1.iterrows():
+        sheet_name = str(row.get(get_col(df1, "姓名"), "")).strip()
+        mobile = normalize_mobile(row.get(get_col(df1, "手机号"), ""))
+        if not (sheet_name and mobile):
+            continue
+        matched = by_mobile.get(mobile)
+        if matched and matched.get("id"):
+            alias_map[sheet_name] = matched.get("id")
+    return alias_map
+
+
 def template_defaults_from_model(bill_type, default_model):
     defaults = {
         "businessType": "PRIVATE",
         "componentJson": [],
+        "icon": "md-pricetag",
+        "iconColor": "#4c7cc3",
         "payFlag": True,
         "requestScope": False,
     }
@@ -338,6 +368,8 @@ def template_defaults_from_model(bill_type, default_model):
         "businessType",
         "componentJson",
         "feeScopeFlag",
+        "icon",
+        "iconColor",
         "lessThanApplyAmount",
         "loanRelateFlag",
         "loanRelateNecessary",
@@ -449,6 +481,9 @@ def main():
     print("\n1️⃣ 查询系统中现有员工...")
     existing_users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
     existing_user_names = {u.get("nickName"): u for u in existing_users if u.get("nickName")}
+    df1_check = read_sheet_with_header(xlsx, "01_添加员工", "是否导入")
+    df1_check = df1_check[df1_check[get_col(df1_check, "是否导入")].astype(str).str.strip() == "是"].copy()
+    existing_user_aliases = build_sheet_user_aliases(df1_check, existing_users)
     print(f"   系统中共有 {len(existing_user_names)} 名员工")
     
     # 2. 查询系统中所有费用科目
@@ -522,7 +557,7 @@ def main():
             for person in [p.strip() for p in people_str.split(",") if p.strip()]:
                 if person not in checked_people:
                     checked_people.add(person)
-                    if person not in existing_user_names:
+                    if person not in existing_user_names and person not in existing_user_aliases:
                         missing_people.append(person)
     
     if missing_people:
@@ -579,7 +614,7 @@ def main():
     df1 = df1[df1[get_col(df1, "是否导入")].astype(str).str.strip() == "是"]
     for i, row in df1.iterrows():
         name = str(row.get(get_col(df1, "姓名"), "")).strip()
-        mobile = str(row.get(get_col(df1, "手机号"), "")).strip()[:11]
+        mobile = normalize_mobile(row.get(get_col(df1, "手机号"), ""))
         dept = str(row.get(get_col(df1, "二级部门"), "")).strip()
         if not dept or dept.lower() == "nan":
             dept = str(row.get(get_col(df1, "一级部门名称"), "")).strip()
@@ -605,6 +640,8 @@ def main():
     # Step1 完成后刷新用户列表，确保能获取到所有员工（包括刚添加的和已存在的）
     users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
     user_map = {u.get("nickName"): u.get("id") for u in users if u.get("nickName") and u.get("id")}
+    for alias_name, alias_uid in build_sheet_user_aliases(df1, users).items():
+        user_map.setdefault(alias_name, alias_uid)
 
     # Fee templates tree - 获取系统中已有的一级科目，只用于验证一级存在性
     fee_tree = requests.get(f"{BASE_URL}/api/bill/feeTemplate/queryFeeTemplate", headers=h, params={"companyId": company_id, "status": 0, "pageSize": 1000}, timeout=20).json().get("result", [])
@@ -756,16 +793,13 @@ def main():
             continue
 
         update_payload = {
-            "id": rid,
+            "roleId": rid,
             "companyId": company_id,
-            "name": doc,
-            "parentId": fee_role_group_id,
-            "dataType": "FEE_TYPE",
             "feeTemplateIds": sorted(bindings["fee_ids"]),
             "userIds": sorted(bindings["user_ids"]),
         }
         rel = requests.post(
-            f"{BASE_URL}/api/member/role/update",
+            f"{BASE_URL}/api/member/role/add/relation",
             headers=h,
             json=update_payload,
             timeout=12,
@@ -851,10 +885,12 @@ def main():
                     bill_type,
                     preferred_browser=args.browser,
                     group_id=group_map.get(group_name) or 0,
+                    fresh_page=True,
                 )
                 report["step3"]["default_model_ok"].append(
                     {
                         "type": bill_type,
+                        "source": default_bill_models[bill_type].get("_source", "browser"),
                         "component_count": len(default_bill_models[bill_type].get("componentJson") or []),
                     }
                 )
@@ -873,8 +909,8 @@ def main():
             "feeIds": [],
             "feeScopeFlag": model_defaults.get("feeScopeFlag", False),
             "groupId": group_map.get(group_name),
-            "icon": "md-pricetag",
-            "iconColor": "#4c7cc3",
+            "icon": model_defaults.get("icon", "md-pricetag"),
+            "iconColor": model_defaults.get("iconColor", "#4c7cc3"),
             "loanIds": [],
             "name": doc_name,
             "payFlag": model_defaults.get("payFlag", True),
