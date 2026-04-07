@@ -633,15 +633,27 @@ def main():
     # 5. 判断归属单据名称和单据适配人员是否同时存在
     # 6. 如果同时存在：
     #    - 确保费用角色组存在（不存在则创建）
-    #    - 为每个人员创建一个角色（角色名称为人员姓名）
-    #    - 角色类型：费用类型角色
-    #    - 把人员和费用科目绑定到角色
+    #    - 以“单据模板名称”创建一个费用角色
+    #    - 把该单据对应的所有末级费用科目绑定到这个角色
+    #    - 把该单据适配的所有人员绑定到这个角色
 
     fee_role_group_id = ensure_fee_role_group(company_id, h)
     _, fee_roles = fee_roles_map(company_id, h)
-    # 缓存每个角色已绑定的费用科目和人员 {role_id: {"fee_ids": set(), "user_ids": set()}}
-    role_bindings_cache = {}
     has_people = {}
+    doc_people_map = {}
+    doc_role_bindings = {}
+
+    for _, row in df2.iterrows():
+        doc = str(row.get(get_col(df2, "归属单据名称"), "")).strip()
+        people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
+        if not doc:
+            continue
+        has_people[doc] = has_people.get(doc, False) or bool(people)
+        if doc not in doc_people_map:
+            doc_people_map[doc] = []
+        for person_name in people:
+            if person_name not in doc_people_map[doc]:
+                doc_people_map[doc].append(person_name)
 
     for _, row in df2.iterrows():
         p = str(row.get(get_col(df2, "一级费用科目"), "")).strip()
@@ -649,11 +661,8 @@ def main():
         t3 = str(row.get(get_col(df2, "三级费用科目"), "")).strip()
         t4 = str(row.get(get_col(df2, "四级费用科目"), "")).strip() if any("四级费用科目" in str(c) for c in df2.columns) else ""
         doc = str(row.get(get_col(df2, "归属单据名称"), "")).strip()
-        people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
         if not (p and s and doc):
             continue
-
-        has_people[doc] = has_people.get(doc, False) or bool(people)
 
         primary_info = primary.get(p)
         if not primary_info:
@@ -720,74 +729,53 @@ def main():
         if leaf_id not in report["step2"]["leaf_by_doc"][doc]:
             report["step2"]["leaf_by_doc"][doc].append(leaf_id)
 
-        # 条件触发费用角色链路：为每个人员创建一个角色（角色名称为人员姓名）
-        if people:
-            for person_name in people:
-                uid = user_map.get(person_name)
-                if not uid:
-                    report["step2"]["relations_fail"].append({"doc": doc, "人员": person_name, "message": f"人员 '{person_name}' 在系统中不存在"})
-                    continue
+        if has_people.get(doc, False):
+            doc_role_bindings.setdefault(doc, {"fee_ids": set(), "user_ids": set()})
+            doc_role_bindings[doc]["fee_ids"].add(leaf_id)
 
-                exact_name = person_name.strip()
-                fallback_name = ''.join([c for c in exact_name if not c.isdigit()]).strip()
+    for doc, bindings in doc_role_bindings.items():
+        people = doc_people_map.get(doc, [])
+        for person_name in people:
+            uid = user_map.get(person_name)
+            if not uid:
+                report["step2"]["relations_fail"].append({"doc": doc, "人员": person_name, "message": f"人员 '{person_name}' 在系统中不存在"})
+                continue
+            bindings["user_ids"].add(uid)
 
-                rid = fee_roles.get(exact_name)
-                if not rid and fallback_name:
-                    rid = fee_roles.get(fallback_name)
-                if not rid and fee_role_group_id:
-                    rid = ensure_fee_role(exact_name, fee_role_group_id, company_id, h)
-                    _, fee_roles = fee_roles_map(company_id, h)
+        if not bindings["user_ids"]:
+            report["step2"]["relations_fail"].append({"doc": doc, "message": "单据适配人员为空或都未在系统中找到，跳过费用角色创建"})
+            continue
 
-                if not rid:
-                    report["step2"]["relations_fail"].append({"doc": doc, "人员": person_name, "尝试名称": fallback_name, "message": "角色未找到且自动创建失败"})
-                    continue
+        rid = fee_roles.get(doc)
+        if not rid and fee_role_group_id:
+            rid = ensure_fee_role(doc, fee_role_group_id, company_id, h)
+            _, fee_roles = fee_roles_map(company_id, h)
 
-                update_role_payload = {
-                    "id": rid,
-                    "companyId": company_id,
-                    "name": exact_name,
-                    "dataType": "FEE_TYPE",
-                    "parentId": fee_role_group_id,
-                }
-                update_role_resp = requests.post(
-                    f"{BASE_URL}/api/member/role/update",
-                    headers=h,
-                    json=update_role_payload,
-                    timeout=12,
-                ).json()
-                if not is_ok(update_role_resp):
-                    report["step2"]["relations_fail"].append({"doc": doc, "人员": person_name, "尝试名称": exact_name, "message": f"更新角色类型失败: {update_role_resp.get('message')}"})
-                    continue
+        if not rid:
+            report["step2"]["relations_fail"].append({"doc": doc, "角色名称": doc, "message": "按单据模板名称创建费用角色失败"})
+            continue
 
-                if rid not in role_bindings_cache:
-                    role_bindings_cache[rid] = {"fee_ids": set(), "user_ids": set()}
-                role_bindings_cache[rid]["fee_ids"].add(leaf_id)
-                role_bindings_cache[rid]["user_ids"].add(uid)
+        update_payload = {
+            "id": rid,
+            "companyId": company_id,
+            "name": doc,
+            "parentId": fee_role_group_id,
+            "dataType": "FEE_TYPE",
+            "feeTemplateIds": sorted(bindings["fee_ids"]),
+            "userIds": sorted(bindings["user_ids"]),
+        }
+        rel = requests.post(
+            f"{BASE_URL}/api/member/role/update",
+            headers=h,
+            json=update_payload,
+            timeout=12,
+        ).json()
 
-                update_payload = {
-                    "id": rid,
-                    "companyId": company_id,
-                    "name": exact_name,
-                    "parentId": fee_role_group_id,
-                    "dataType": "FEE_TYPE",
-                    "feeTemplateIds": list(role_bindings_cache[rid]["fee_ids"]),
-                    "userIds": list(role_bindings_cache[rid]["user_ids"]),
-                }
-                rel = requests.post(
-                    f"{BASE_URL}/api/member/role/update",
-                    headers=h,
-                    json=update_payload,
-                    timeout=12,
-                ).json()
-
-                if is_ok(rel):
-                    report["step2"]["relations_ok"] += 1
-                    if doc not in report["step2"]["role_by_doc"]:
-                        report["step2"]["role_by_doc"][doc] = []
-                    if rid not in report["step2"]["role_by_doc"][doc]:
-                        report["step2"]["role_by_doc"][doc].append(rid)
-                else:
-                    report["step2"]["relations_fail"].append({"doc": doc, "人员": person_name, "message": rel.get("message")})
+        if is_ok(rel):
+            report["step2"]["relations_ok"] += 1
+            report["step2"]["role_by_doc"][doc] = [rid]
+        else:
+            report["step2"]["relations_fail"].append({"doc": doc, "角色名称": doc, "message": rel.get("message")})
 
     # Step2.5
     wfs = requests.get(f"{BASE_URL}/api/bpm/workflow/queryWorkFlow", headers=h, params={"companyId": company_id, "size": 200}, timeout=12).json().get("result", []) or []
