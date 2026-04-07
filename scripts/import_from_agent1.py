@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from browser_session import BASE_URL, get_auth, ui_save_bill_template
+from browser_session import BASE_URL, get_auth, get_default_bill_model, ui_save_bill_template
 
 
 def is_ok(resp):
@@ -296,6 +296,63 @@ def split_values(v):
     return [x.strip() for x in t.split(",") if x.strip()]
 
 
+def template_defaults_from_model(bill_type, default_model):
+    defaults = {
+        "businessType": "PRIVATE",
+        "componentJson": [],
+        "payFlag": True,
+        "requestScope": False,
+    }
+    if bill_type in {"EXPENSE", "PAYMENT"}:
+        defaults.update(
+            {
+                "applyRelateFlag": True,
+                "applyRelateNecessary": False,
+                "feeScopeFlag": False,
+            }
+        )
+    elif bill_type == "LOAN":
+        defaults.update(
+            {
+                "applyRelateFlag": False,
+                "refundDateFlag": False,
+            }
+        )
+    elif bill_type == "REQUISITION":
+        defaults.update(
+            {
+                "feeScopeFlag": False,
+                "applyContentType": "SUMFEE",
+                "lessThanApplyAmount": False,
+                "relatOnce": False,
+            }
+        )
+
+    if not default_model:
+        return defaults
+
+    for key in [
+        "applyRelateFlag",
+        "applyRelateNecessary",
+        "applyContentType",
+        "businessType",
+        "componentJson",
+        "feeScopeFlag",
+        "lessThanApplyAmount",
+        "loanRelateFlag",
+        "loanRelateNecessary",
+        "loanRequestScope",
+        "needRepayFlag",
+        "payFlag",
+        "refundDateFlag",
+        "relatOnce",
+        "requestScope",
+    ]:
+        if key in default_model and default_model.get(key) is not None:
+            defaults[key] = default_model.get(key)
+    return defaults
+
+
 def read_sheet_with_header(path: Path, sheet: str, header_key: str):
     raw = pd.read_excel(path, sheet_name=sheet, header=None)
     header_row = raw.index[raw.apply(lambda r: r.astype(str).str.contains(header_key, regex=False).any(), axis=1)][0]
@@ -368,6 +425,8 @@ def main():
             "branch_fee_role": [],
             "branch_leaf_fee": [],
             "branch_skip": [],
+            "default_model_ok": [],
+            "default_model_fail": [],
             "ui_save_ok": [],
             "ui_save_fail": [],
         },
@@ -772,6 +831,7 @@ def main():
     type_map = {"报销单": "EXPENSE", "借款单": "LOAN", "批量付款单": "PAYMENT", "申请单": "REQUISITION"}
 
     created_docs = []
+    default_bill_models = {}
     for _, row in df3.iterrows():
         group_name = str(row.get(get_col(df3, "单据分组（一级目录）"), "")).strip()
         doc_type = str(row.get(get_col(df3, "单据大类（二级目录）"), "")).strip()
@@ -795,33 +855,62 @@ def main():
         has_targets = bool(targets) and bool(role_ids or user_ids or dep_ids)
         is_limited_type = vis_type == "限制" or vis_type == "角色" or vis_type == "员工" or vis_type == "部门"
         has_visibility = is_limited_type and has_targets
+        bill_type = type_map.get(doc_type, "EXPENSE")
+
+        if bill_type not in default_bill_models:
+            try:
+                default_bill_models[bill_type] = get_default_bill_model(
+                    bill_type,
+                    preferred_browser=args.browser,
+                    group_id=group_map.get(group_name) or 0,
+                )
+                report["step3"]["default_model_ok"].append(
+                    {
+                        "type": bill_type,
+                        "component_count": len(default_bill_models[bill_type].get("componentJson") or []),
+                    }
+                )
+            except Exception as exc:
+                default_bill_models[bill_type] = {}
+                report["step3"]["default_model_fail"].append({"type": bill_type, "message": str(exc)})
+        model_defaults = template_defaults_from_model(bill_type, default_bill_models.get(bill_type) or {})
 
         payload = {
-            "applyRelateFlag": True,
-            "applyRelateNecessary": False,
-            "businessType": "PRIVATE",
+            "applyRelateFlag": model_defaults.get("applyRelateFlag", True),
+            "applyRelateNecessary": model_defaults.get("applyRelateNecessary", False),
+            "businessType": model_defaults.get("businessType", "PRIVATE"),
             "companyId": company_id,
-            "componentJson": [],
+            "componentJson": model_defaults.get("componentJson") or [],
             "departmentIds": dep_ids if has_visibility else [],
             "feeIds": [],
-            "feeScopeFlag": False,
+            "feeScopeFlag": model_defaults.get("feeScopeFlag", False),
             "groupId": group_map.get(group_name),
             "icon": "md-pricetag",
             "iconColor": "#4c7cc3",
             "loanIds": [],
             "name": doc_name,
-            "payFlag": True,
-            "requestScope": False,
+            "payFlag": model_defaults.get("payFlag", True),
+            "requestScope": model_defaults.get("requestScope", False),
             "requisitionIds": [],
             "roleIds": role_ids if has_visibility else [],
             "status": "ACTIVE",
-            "type": type_map.get(doc_type, "EXPENSE"),
+            "type": bill_type,
             "userIds": user_ids if has_visibility else [],
             "userScopeFlag": has_visibility,
             "workFlowId": workflow_id,
         }
-        if payload["type"] == "REQUISITION":
-            payload["applyContentType"] = "TEXT"
+        for extra_key in [
+            "applyContentType",
+            "lessThanApplyAmount",
+            "loanRelateFlag",
+            "loanRelateNecessary",
+            "loanRequestScope",
+            "needRepayFlag",
+            "refundDateFlag",
+            "relatOnce",
+        ]:
+            if extra_key in model_defaults:
+                payload[extra_key] = model_defaults[extra_key]
 
         # 费用限制分支
         # 只有当单据已成功匹配到费用角色且角色里有人时，才勾选“限制费用类型”

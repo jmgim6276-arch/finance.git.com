@@ -13,6 +13,7 @@ import websocket
 
 BASE_URL = "https://cst.uf-tree.com"
 LOGIN_URL = f"{BASE_URL}/login"
+BILL_TEMPLATE_URL = f"{BASE_URL}/bill/bills"
 
 BROWSERS = [
     {
@@ -212,19 +213,7 @@ def cdp_navigate(page, url):
     return None
 
 
-def ensure_bill_template_page(browser, reload_page=False):
-    bill_url = f"{BASE_URL}/bill/bills"
-    page = get_page_by_url(browser, "/bill/bills")
-    if not page:
-        open_target(browser, bill_url)
-        time.sleep(1)
-        page = get_page_by_url(browser, "/bill/bills")
-    if not page:
-        raise RuntimeError("未能打开单据模板页面")
-
-    if reload_page:
-        cdp_navigate(page, bill_url)
-
+def wait_for_bill_template_page(page, timeout=20):
     def _ready():
         raw = cdp_eval(
             page,
@@ -243,10 +232,123 @@ def ensure_bill_template_page(browser, reload_page=False):
             return page
         return None
 
-    ready_page = wait_for(_ready, timeout=20, interval=1)
+    ready_page = wait_for(_ready, timeout=timeout, interval=1)
     if not ready_page:
         raise RuntimeError("单据模板页面未就绪")
     return ready_page
+
+
+def ensure_bill_template_page(browser, reload_page=False):
+    page = get_page_by_url(browser, "/bill/bills")
+    if not page:
+        open_target(browser, BILL_TEMPLATE_URL)
+        time.sleep(1)
+        page = get_page_by_url(browser, "/bill/bills")
+    if not page:
+        raise RuntimeError("未能打开单据模板页面")
+
+    if reload_page:
+        cdp_navigate(page, BILL_TEMPLATE_URL)
+
+    return wait_for_bill_template_page(page)
+
+
+def open_fresh_bill_template_page(browser):
+    page = open_target(browser, BILL_TEMPLATE_URL)
+    if not page:
+        raise RuntimeError("未能新建单据模板页面")
+    time.sleep(1)
+    return wait_for_bill_template_page(page)
+
+
+def get_default_bill_model_on_page(page, bill_type, group_id=0):
+    raw = cdp_eval(
+        page,
+        f"""
+        (() => {{
+          try {{
+          function findVm(vm, predicate) {{
+            if (!vm) return null;
+            if (predicate(vm)) return vm;
+            for (const child of (vm.$children || [])) {{
+              const found = findVm(child, predicate);
+              if (found) return found;
+            }}
+            return null;
+          }}
+          const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+          const billsVm = findVm(root, vm => vm.$options && vm.$options.methods && typeof vm.$options.methods.fnClickAddBill === 'function');
+          if (!billsVm) return JSON.stringify({{ ok: false, reason: 'billsVm-not-found' }});
+          const state = billsVm.$store && billsVm.$store.state && billsVm.$store.state.bills;
+          if (!state) return JSON.stringify({{ ok: false, reason: 'bills-state-not-found' }});
+
+          billsVm.bIsEditedBill = false;
+          state.bIsEditedBill = false;
+          if (typeof billsVm.fnBsnResetBasicForm !== 'function') {{
+            billsVm.fnBsnResetBasicForm = () => {{}};
+          }}
+          if (typeof billsVm.fnBsnResetTab !== 'function') {{
+            billsVm.fnBsnResetTab = () => {{}};
+          }}
+          billsVm.oAddBillForm = {{
+            groupId: {int(group_id or 0)},
+            type: {json.dumps(bill_type, ensure_ascii=False)}
+          }};
+
+          const formRef = billsVm.$refs && billsVm.$refs.comAddBillForm;
+          const originalValidate = formRef && formRef.validate;
+          if (formRef) {{
+            formRef.validate = cb => cb(true);
+          }}
+
+          try {{
+            billsVm.fnClickAddBill();
+          }} finally {{
+            if (formRef && originalValidate) {{
+              formRef.validate = originalValidate;
+            }}
+          }}
+
+          const bill = state.bill ? JSON.parse(JSON.stringify(state.bill)) : null;
+          billsVm.bIsEditedBill = false;
+          state.bIsEditedBill = false;
+
+          if (!bill) return JSON.stringify({{ ok: false, reason: 'bill-not-created' }});
+          return JSON.stringify({{ ok: true, bill }});
+          }} catch (err) {{
+            return JSON.stringify({{
+              ok: false,
+              reason: 'exception',
+              message: String(err),
+              stack: err && err.stack ? String(err.stack) : null
+            }});
+          }}
+        }})()
+        """,
+    )
+    info = json.loads(raw or "{}")
+    if not info.get("ok"):
+        raise RuntimeError(f"读取默认单据模型失败：{info}")
+    return info.get("bill") or {}
+
+
+def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False):
+    browser = find_browser(preferred=preferred_browser, require_cst=True)
+    if not browser:
+        raise RuntimeError("未找到已登录的财税通浏览器页面，无法读取默认单据模型")
+
+    errors = []
+    tried_existing = False
+    for use_fresh in ([True, False] if fresh_page else [False, True]):
+        if not use_fresh and tried_existing:
+            continue
+        try:
+            page = open_fresh_bill_template_page(browser) if use_fresh else ensure_bill_template_page(browser, reload_page=False)
+            tried_existing = tried_existing or not use_fresh
+            return get_default_bill_model_on_page(page, bill_type=bill_type, group_id=group_id)
+        except Exception as exc:
+            errors.append({"fresh_page": use_fresh, "message": str(exc)})
+    raise RuntimeError(f"读取默认单据模型失败：{errors}")
 
 
 def get_vuex_raw(page):
