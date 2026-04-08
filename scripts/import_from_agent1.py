@@ -287,8 +287,148 @@ def ensure_fee_role(role_name, fee_role_group_id, company_id, headers):
     return None
 
 
+def normalize_text(v):
+    if pd.isna(v):
+        return ""
+    return str(v).replace("\xa0", " ").strip()
+
+
+def role_nodes_map(company_id, headers):
+    tree = get_role_tree(company_id, headers)
+    role_map = {}
+
+    def walk(nodes, root_name=None, depth=0):
+        for node in nodes or []:
+            node_name = normalize_text(node.get("name"))
+            current_root = root_name or node_name
+            if depth >= 1 and node_name and node.get("id"):
+                role_map.setdefault(
+                    node_name,
+                    {
+                        "id": node.get("id"),
+                        "name": node_name,
+                        "dataType": node.get("dataType"),
+                        "parentId": node.get("parentId"),
+                        "rootName": current_root,
+                    },
+                )
+            walk(node.get("children") or [], current_root, depth + 1)
+
+    walk(tree)
+    return role_map
+
+
+def add_role_relation(role_info, user_ids, company_id, headers, department_ids=None):
+    payload = {
+        "roleId": role_info.get("id"),
+        "userIds": sorted(set(user_ids)),
+    }
+    if role_info.get("dataType") == "DEPARTMENT":
+        payload["departmentIds"] = sorted(set(department_ids or []))
+
+    return requests.post(
+        f"{BASE_URL}/api/member/role/add/relation",
+        headers=headers,
+        json=payload,
+        timeout=12,
+    ).json()
+
+
+def set_user_departments_exact(user_id, department_ids, company_id, headers):
+    payload = {
+        "companyId": company_id,
+        "users": [user_id],
+        "departments": unique_list(department_ids),
+    }
+    return requests.post(
+        f"{BASE_URL}/api/member/department/setUsersDepartments",
+        headers=headers,
+        json=payload,
+        timeout=12,
+    ).json()
+
+
+def flatten_departments(nodes):
+    dep_map = {}
+
+    def walk(items):
+        for item in items or []:
+            title = normalize_text(item.get("title"))
+            dep_id = item.get("id")
+            if title and dep_id:
+                dep_map[title] = dep_id
+            walk(item.get("children") or [])
+
+    walk(nodes)
+    return dep_map
+
+
+def build_department_context(nodes):
+    title_to_id = {}
+    id_to_node = {}
+
+    def walk(items):
+        for item in items or []:
+            dep_id = item.get("id")
+            title = normalize_text(item.get("title"))
+            if dep_id:
+                id_to_node[dep_id] = item
+            if title and dep_id and title not in title_to_id:
+                title_to_id[title] = dep_id
+            walk(item.get("children") or [])
+
+    walk(nodes)
+    return title_to_id, id_to_node
+
+
+def unique_list(values):
+    result = []
+    seen = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def resolve_department_ids_from_row(row, df1, dep_title_map, dep_nodes_by_id):
+    dept_titles = []
+    for label in ["一级部门名称", "二级部门", "三级部门"]:
+        try:
+            col = get_col(df1, label)
+        except KeyError:
+            continue
+        title = normalize_text(row.get(col, ""))
+        if title and title.lower() != "nan":
+            dept_titles.append(title)
+
+    deepest_id = None
+    for title in reversed(dept_titles):
+        if title in dep_title_map:
+            deepest_id = dep_title_map[title]
+            break
+
+    if deepest_id:
+        dept_ids = [deepest_id]
+        visited = {deepest_id}
+        current_id = deepest_id
+        while current_id in dep_nodes_by_id:
+            parent_id = dep_nodes_by_id[current_id].get("parentId")
+            if not parent_id or parent_id == -1:
+                break
+            if parent_id not in visited and parent_id in dep_nodes_by_id:
+                dept_ids.append(parent_id)
+                visited.add(parent_id)
+            current_id = parent_id
+    else:
+        dept_ids = [dep_title_map[title] for title in dept_titles if title in dep_title_map]
+
+    return unique_list(dept_ids), dept_titles
+
+
 def split_values(v):
-    t = str(v).strip()
+    t = normalize_text(v)
     if not t or t.lower() == "nan":
         return []
     for ch in ["，", "、", ";", "；"]:
@@ -314,7 +454,7 @@ def build_sheet_user_aliases(df1, users):
 
     alias_map = {}
     for _, row in df1.iterrows():
-        sheet_name = str(row.get(get_col(df1, "姓名"), "")).strip()
+        sheet_name = normalize_text(row.get(get_col(df1, "姓名"), ""))
         mobile = normalize_mobile(row.get(get_col(df1, "手机号"), ""))
         if not (sheet_name and mobile):
             continue
@@ -449,6 +589,8 @@ def main():
         "companyId": company_id,
         "xlsx": str(xlsx),
         "step1": {"ok": 0, "fail": []},
+        "step1_department_sync": {"ok": 0, "fail": []},
+        "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}},
         "step2": {"relations_ok": 0, "relations_fail": [], "role_by_doc": {}, "leaf_by_doc": {}},
         "step25": {},
         "step3": {
@@ -468,7 +610,7 @@ def main():
     users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
     user_map = {u.get("nickName"): u.get("id") for u in users if u.get("nickName") and u.get("id")}
     deps = requests.get(f"{BASE_URL}/api/member/department/queryDepartments", headers=h, params={"companyId": company_id}, timeout=15).json().get("result", [])
-    dep_map = {d.get("title"): d.get("id") for d in deps if d.get("title") and d.get("id")}
+    dep_map, dep_nodes_by_id = build_department_context(deps)
 
     # ===== 数据核对阶段 =====
     print("\n" + "="*50)
@@ -499,10 +641,10 @@ def main():
             existing_primary[str(p.get("name", "")).strip()] = p.get("id")
         else:
             parent_id = p.get("parentId")
-            for c in p.get("children", []):
+            for c in (p.get("children") or []):
                 existing_secondary[(parent_id, str(c.get("name", "")).strip())] = c.get("id")
                 # 查找三级
-                for t3 in c.get("children", []):
+                for t3 in (c.get("children") or []):
                     existing_third[(c.get("id"), str(t3.get("name", "")).strip())] = t3.get("id")
     
     print(f"   一级科目: {len(existing_primary)} 个")
@@ -514,7 +656,7 @@ def main():
     existing_templates = requests.get(f"{BASE_URL}/api/bill/template/queryTemplateTree", headers=h, params={"companyId": company_id}, timeout=12).json().get("result", []) or []
     existing_template_names = set()
     for g in existing_templates:
-        for t in g.get("children", []):
+        for t in (g.get("children") or []):
             if t.get("name"):
                 existing_template_names.add(t.get("name"))
     print(f"   系统中共有 {len(existing_template_names)} 个单据模板")
@@ -570,7 +712,38 @@ def main():
         has_error = True
     else:
         print(f"   ✅ 所有 {len(checked_people)} 名单据适配人员都存在")
-    
+
+    # 核对第一张表里的角色管理
+    print("\n5️⃣ 补充核对角色管理列...")
+    try:
+        role_col_check = get_col(df1_check, "角色管理")
+    except KeyError:
+        role_col_check = None
+
+    existing_roles = role_nodes_map(company_id, h) if role_col_check else {}
+    missing_roles = []
+    checked_roles = set()
+
+    if role_col_check:
+        for _, row in df1_check.iterrows():
+            for role_name in split_values(row.get(role_col_check, "")):
+                role_name = normalize_text(role_name)
+                if not role_name or role_name in checked_roles:
+                    continue
+                checked_roles.add(role_name)
+                if role_name not in existing_roles:
+                    missing_roles.append(role_name)
+
+        if missing_roles:
+            print("\n   ❌ 以下角色在角色管理中不存在：")
+            for role_name in missing_roles:
+                print(f"      - {role_name}")
+            has_error = True
+        else:
+            print(f"   ✅ 角色管理列中的 {len(checked_roles)} 个角色都存在")
+    else:
+        print("   ℹ️ 第一张表没有检测到“角色管理”列，跳过角色绑定预检")
+
     # 核对 03_单据表
     print("\n6️⃣ 核对 03_单据表...")
     df3_check = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
@@ -612,17 +785,23 @@ def main():
     # Step1
     df1 = read_sheet_with_header(xlsx, "01_添加员工", "是否导入")
     df1 = df1[df1[get_col(df1, "是否导入")].astype(str).str.strip() == "是"]
+    try:
+        role_col = get_col(df1, "角色管理")
+    except KeyError:
+        role_col = None
+    existing_user_by_mobile = {}
+    for u in users:
+        mobile = normalize_mobile(u.get("mobile") or u.get("userName") or u.get("phone"))
+        if mobile and mobile not in existing_user_by_mobile:
+            existing_user_by_mobile[mobile] = u
     for i, row in df1.iterrows():
-        name = str(row.get(get_col(df1, "姓名"), "")).strip()
+        name = normalize_text(row.get(get_col(df1, "姓名"), ""))
         mobile = normalize_mobile(row.get(get_col(df1, "手机号"), ""))
-        dept = str(row.get(get_col(df1, "二级部门"), "")).strip()
-        if not dept or dept.lower() == "nan":
-            dept = str(row.get(get_col(df1, "一级部门名称"), "")).strip()
-        dep_id = dep_map.get(dept)
-        if not (name and mobile and dep_id):
+        department_ids, department_titles = resolve_department_ids_from_row(row, df1, dep_map, dep_nodes_by_id)
+        if not (name and mobile and department_ids):
             report["step1"]["fail"].append({"row": int(i + 1), "reason": "姓名/手机号/部门缺失或无效"})
             continue
-        payload = {"nickName": name, "mobile": mobile, "departmentIds": [dep_id], "companyId": company_id}
+        payload = {"nickName": name, "mobile": mobile, "departmentIds": department_ids, "companyId": company_id}
         r = requests.post(f"{BASE_URL}/api/member/userInfo/add", headers=h, json=payload, timeout=12).json()
         if r.get("code") == 200 or r.get("success"):
             report["step1"]["ok"] += 1
@@ -630,18 +809,153 @@ def main():
             new_uid = r.get("result")
             if new_uid:
                 user_map[name] = new_uid
+                existing_user_by_mobile[mobile] = {
+                    "id": new_uid,
+                    "nickName": name,
+                    "mobile": mobile,
+                    "userName": mobile,
+                }
         else:
             msg = str(r.get("message", ""))
             if "已" in msg or "存在" in msg:
-                report["step1"]["ok"] += 1
+                existing_user = existing_user_by_mobile.get(mobile)
+                if existing_user and existing_user.get("id"):
+                    update_payload = {
+                        "id": existing_user.get("id"),
+                        "nickName": name,
+                        "mobile": mobile,
+                        "departmentIds": department_ids,
+                        "companyId": company_id,
+                    }
+                    update_resp = requests.post(
+                        f"{BASE_URL}/api/member/userInfo/update",
+                        headers=h,
+                        json=update_payload,
+                        timeout=12,
+                    ).json()
+                    if is_ok(update_resp):
+                        report["step1"]["ok"] += 1
+                    else:
+                        report["step1"]["fail"].append(
+                            {
+                                "row": int(i + 1),
+                                "reason": f"员工已存在，但更新部门失败: {update_resp.get('message')}",
+                                "departments": department_titles,
+                            }
+                        )
+                else:
+                    report["step1"]["ok"] += 1
             else:
                 report["step1"]["fail"].append({"row": int(i + 1), "reason": msg})
 
     # Step1 完成后刷新用户列表，确保能获取到所有员工（包括刚添加的和已存在的）
     users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
     user_map = {u.get("nickName"): u.get("id") for u in users if u.get("nickName") and u.get("id")}
+    user_by_mobile = {}
+    for u in users:
+        mobile = normalize_mobile(u.get("mobile") or u.get("userName") or u.get("phone"))
+        if mobile and mobile not in user_by_mobile:
+            user_by_mobile[mobile] = u
     for alias_name, alias_uid in build_sheet_user_aliases(df1, users).items():
         user_map.setdefault(alias_name, alias_uid)
+
+    for i, row in df1.iterrows():
+        name = normalize_text(row.get(get_col(df1, "姓名"), ""))
+        mobile = normalize_mobile(row.get(get_col(df1, "手机号"), ""))
+        department_ids, department_titles = resolve_department_ids_from_row(row, df1, dep_map, dep_nodes_by_id)
+        if not (name and department_ids):
+            continue
+
+        user_id = user_map.get(name)
+        if not user_id and mobile and user_by_mobile.get(mobile):
+            user_id = user_by_mobile[mobile].get("id")
+        if not user_id:
+            report["step1_department_sync"]["fail"].append(
+                {"row": int(i + 1), "姓名": name, "departments": department_titles, "message": "员工导入后未找到，无法精确同步部门"}
+            )
+            continue
+
+        sync_resp = set_user_departments_exact(user_id, department_ids, company_id, h)
+        if is_ok(sync_resp):
+            report["step1_department_sync"]["ok"] += 1
+        else:
+            report["step1_department_sync"]["fail"].append(
+                {
+                    "row": int(i + 1),
+                    "姓名": name,
+                    "departments": department_titles,
+                    "departmentIds": department_ids,
+                    "message": sync_resp.get("message"),
+                }
+            )
+
+    if role_col:
+        role_bindings = {}
+        existing_roles = role_nodes_map(company_id, h)
+        for i, row in df1.iterrows():
+            name = normalize_text(row.get(get_col(df1, "姓名"), ""))
+            if not name:
+                continue
+            user_id = user_map.get(name)
+            if not user_id:
+                report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "message": "员工导入后未在系统员工列表中找到"})
+                continue
+            department_ids, _ = resolve_department_ids_from_row(row, df1, dep_map, dep_nodes_by_id)
+
+            for role_name in split_values(row.get(role_col, "")):
+                role_name = normalize_text(role_name)
+                if not role_name:
+                    continue
+                role_info = existing_roles.get(role_name)
+                if not role_info:
+                    report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": "角色管理中不存在该角色"})
+                    continue
+                if role_info.get("dataType") not in {"COMPANY", "DEPARTMENT"}:
+                    report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": f"暂不支持给 {role_info.get('dataType')} 类型角色自动加人"})
+                    continue
+                if role_info.get("dataType") == "DEPARTMENT" and not department_ids:
+                    report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": "部门角色缺少有效部门，无法绑定"})
+                    continue
+
+                binding = role_bindings.setdefault(
+                    role_name,
+                    {
+                        "role": role_info,
+                        "user_ids": set(),
+                        "department_ids": set(),
+                        "users": [],
+                    },
+                )
+                binding["user_ids"].add(user_id)
+                if name not in binding["users"]:
+                    binding["users"].append(name)
+                for dep_id in department_ids:
+                    binding["department_ids"].add(dep_id)
+
+        for role_name, binding in role_bindings.items():
+            role_info = binding["role"]
+            rel = add_role_relation(
+                role_info,
+                binding["user_ids"],
+                company_id,
+                h,
+                department_ids=binding["department_ids"] if role_info.get("dataType") == "DEPARTMENT" else None,
+            )
+            if is_ok(rel) or "存在" in str(rel.get("message", "")):
+                report["step1_roles"]["ok"] += len(binding["user_ids"])
+                report["step1_roles"]["role_by_name"][role_name] = {
+                    "roleId": role_info.get("id"),
+                    "dataType": role_info.get("dataType"),
+                    "users": binding["users"],
+                }
+            else:
+                report["step1_roles"]["fail"].append(
+                    {
+                        "角色": role_name,
+                        "users": binding["users"],
+                        "message": rel.get("message"),
+                    }
+                )
 
     # Fee templates tree - 获取系统中已有的一级科目，只用于验证一级存在性
     fee_tree = requests.get(f"{BASE_URL}/api/bill/feeTemplate/queryFeeTemplate", headers=h, params={"companyId": company_id, "status": 0, "pageSize": 1000}, timeout=20).json().get("result", [])
@@ -830,7 +1144,13 @@ def main():
         report["step3"]["fail"].append({"doc": "所有", "message": "系统中没有可用的审批流，请先创建审批流"})
         Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print("❌ 导入失败：没有可用的审批流")
-        print(json.dumps({"step1_ok": report["step1"]["ok"], "step2_relations_ok": report["step2"]["relations_ok"], "step3_ok": report["step3"]["ok"], "output": args.output}, ensure_ascii=False, indent=2))
+        print(json.dumps({
+            "step1_ok": report["step1"]["ok"],
+            "step1_roles_ok": report["step1_roles"]["ok"],
+            "step2_relations_ok": report["step2"]["relations_ok"],
+            "step3_ok": report["step3"]["ok"],
+            "output": args.output,
+        }, ensure_ascii=False, indent=2))
         return
 
     # Step3
@@ -981,6 +1301,7 @@ def main():
     print("✅ 导入完成")
     print(json.dumps({
         "step1_ok": report["step1"]["ok"],
+        "step1_roles_ok": report["step1_roles"]["ok"],
         "step2_relations_ok": report["step2"]["relations_ok"],
         "step3_ok": report["step3"]["ok"],
         "output": args.output,
