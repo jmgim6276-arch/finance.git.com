@@ -648,6 +648,34 @@ def open_target(browser, url):
     return resp.json()
 
 
+def activate_page(browser, page):
+    page_id = (page or {}).get("id")
+    if not page_id:
+        return False
+    try:
+        requests.get(
+            f"http://localhost:{browser['port']}/json/activate/{page_id}",
+            timeout=6,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def close_page(browser, page):
+    page_id = (page or {}).get("id")
+    if not page_id:
+        return False
+    try:
+        requests.get(
+            f"http://localhost:{browser['port']}/json/close/{page_id}",
+            timeout=6,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def get_cst_page(browser):
     pages = list_pages(browser)
     for page in pages:
@@ -659,12 +687,14 @@ def get_cst_page(browser):
 def ensure_cst_page(browser, url=LOGIN_URL):
     page = get_cst_page(browser)
     if page:
+        activate_page(browser, page)
         return page
     open_target(browser, url)
     deadline = time.time() + 15
     while time.time() < deadline:
         page = get_cst_page(browser)
         if page:
+            activate_page(browser, page)
             return page
         time.sleep(1)
     raise RuntimeError(f"{browser['name']} 未能打开财税通页面")
@@ -768,6 +798,7 @@ def ensure_bill_template_page(browser, reload_page=False):
     if not page:
         raise RuntimeError("未能打开单据模板页面")
 
+    activate_page(browser, page)
     if reload_page:
         cdp_navigate(page, BILL_TEMPLATE_URL)
 
@@ -779,6 +810,8 @@ def open_fresh_bill_template_page(browser):
     if not page:
         raise RuntimeError("未能新建单据模板页面")
     time.sleep(1)
+    page["_temporary"] = True
+    activate_page(browser, page)
     return wait_for_bill_template_page(page)
 
 
@@ -897,6 +930,7 @@ def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fres
     for use_fresh in ([True, False] if fresh_page else [False, True]):
         if not use_fresh and tried_existing:
             continue
+        page = None
         try:
             page = open_fresh_bill_template_page(browser) if use_fresh else ensure_bill_template_page(browser, reload_page=False)
             tried_existing = tried_existing or not use_fresh
@@ -904,6 +938,9 @@ def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fres
             return stabilize_default_bill_model(bill_type, model, group_id=group_id)
         except Exception as exc:
             errors.append({"fresh_page": use_fresh, "message": str(exc)})
+        finally:
+            if use_fresh and page:
+                close_page(browser, page)
 
     fallback = get_static_default_bill_model(bill_type, group_id=group_id)
     if fallback:
