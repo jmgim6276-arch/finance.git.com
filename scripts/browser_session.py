@@ -1003,6 +1003,22 @@ def wait_for_login_form(page, timeout=20):
     return wait_for(_ready, timeout=timeout, interval=1)
 
 
+def force_login_page(page):
+    return cdp_eval(
+        page,
+        f"""
+        (() => {{
+          try {{
+            localStorage.removeItem('vuex');
+            sessionStorage.clear();
+          }} catch (e) {{}}
+          location.replace({json.dumps(LOGIN_URL)});
+          return true;
+        }})()
+        """,
+    )
+
+
 def submit_login(page, username, password):
     payload = {
         "username": username,
@@ -1335,7 +1351,7 @@ def ensure_login(
             "当前登录态失效，且未提供账号密码。可加 --auto-login，并通过 --username + 终端隐藏输入，或设置 CST_USERNAME/CST_PASSWORD。"
         )
 
-    cdp_navigate(page, LOGIN_URL)
+    force_login_page(page)
     if not wait_for_login_form(page, timeout=20):
         raise RuntimeError("登录页未就绪，无法自动填写账号密码")
 

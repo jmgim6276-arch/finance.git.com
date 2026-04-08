@@ -290,7 +290,10 @@ def ensure_fee_role(role_name, fee_role_group_id, company_id, headers):
 def normalize_text(v):
     if pd.isna(v):
         return ""
-    return str(v).replace("\xa0", " ").strip()
+    text = str(v).replace("\xa0", " ").strip()
+    if text.lower() == "nan":
+        return ""
+    return text
 
 
 def role_nodes_map(company_id, headers):
@@ -316,6 +319,70 @@ def role_nodes_map(company_id, headers):
 
     walk(tree)
     return role_map
+
+
+def standard_role_groups(company_id, headers):
+    tree = get_role_tree(company_id, headers)
+    group_map = {}
+    for node in tree or []:
+        group_name = normalize_text(node.get("name"))
+        if group_name and node.get("id"):
+            group_map[group_name] = {
+                "id": node.get("id"),
+                "name": group_name,
+                "dataType": node.get("dataType"),
+            }
+    return group_map
+
+
+def guess_standard_role_config(role_name, role_groups):
+    dept_keywords = ["部门负责人", "部门主管", "部门经理"]
+    grade_keywords = ["职员", "员工", "管理者", "总监", "专员", "级"]
+    duty_keywords = ["负责人", "经理", "主管", "财务", "出纳", "人事", "行政", "总助", "助理"]
+
+    if any(k in role_name for k in dept_keywords):
+        return ("职务", "DEPARTMENT")
+    if any(k in role_name for k in grade_keywords):
+        return ("职级", "COMPANY")
+    if any(k in role_name for k in duty_keywords):
+        return ("职务", "COMPANY")
+
+    if "职务" in role_groups:
+        return ("职务", "COMPANY")
+    if "职级" in role_groups:
+        return ("职级", "COMPANY")
+
+    for root_name, root_info in role_groups.items():
+        if root_name != "费用角色组":
+            return (root_name, "COMPANY" if root_info.get("dataType") != "DEPARTMENT" else "DEPARTMENT")
+    return (None, None)
+
+
+def ensure_standard_role(role_name, company_id, headers):
+    existing_roles = role_nodes_map(company_id, headers)
+    if role_name in existing_roles:
+        return existing_roles[role_name]
+
+    role_groups = standard_role_groups(company_id, headers)
+    root_name, data_type = guess_standard_role_config(role_name, role_groups)
+    parent = role_groups.get(root_name) if root_name else None
+    if not parent:
+        return None
+
+    add_resp = requests.post(
+        f"{BASE_URL}/api/member/role/add",
+        headers=headers,
+        json={
+            "name": role_name,
+            "companyId": company_id,
+            "parentId": parent.get("id"),
+            "dataType": data_type or "COMPANY",
+        },
+        timeout=12,
+    ).json()
+    if is_ok(add_resp) or "存在" in str(add_resp.get("message", "")):
+        return role_nodes_map(company_id, headers).get(role_name)
+    return None
 
 
 def add_role_relation(role_info, user_ids, company_id, headers, department_ids=None):
@@ -590,7 +657,7 @@ def main():
         "xlsx": str(xlsx),
         "step1": {"ok": 0, "fail": []},
         "step1_department_sync": {"ok": 0, "fail": []},
-        "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}},
+        "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}, "created_roles": []},
         "step2": {"relations_ok": 0, "relations_fail": [], "role_by_doc": {}, "leaf_by_doc": {}},
         "step25": {},
         "step3": {
@@ -735,10 +802,9 @@ def main():
                     missing_roles.append(role_name)
 
         if missing_roles:
-            print("\n   ❌ 以下角色在角色管理中不存在：")
+            print("\n   ⚠️  以下角色当前在系统中不存在，执行时会自动创建：")
             for role_name in missing_roles:
                 print(f"      - {role_name}")
-            has_error = True
         else:
             print(f"   ✅ 角色管理列中的 {len(checked_roles)} 个角色都存在")
     else:
@@ -908,8 +974,14 @@ def main():
                     continue
                 role_info = existing_roles.get(role_name)
                 if not role_info:
-                    report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": "角色管理中不存在该角色"})
-                    continue
+                    role_info = ensure_standard_role(role_name, company_id, h)
+                    if role_info:
+                        existing_roles = role_nodes_map(company_id, h)
+                        if role_name not in report["step1_roles"]["created_roles"]:
+                            report["step1_roles"]["created_roles"].append(role_name)
+                    else:
+                        report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": "角色不存在且自动创建失败"})
+                        continue
                 if role_info.get("dataType") not in {"COMPANY", "DEPARTMENT"}:
                     report["step1_roles"]["fail"].append({"row": int(i + 1), "姓名": name, "角色": role_name, "message": f"暂不支持给 {role_info.get('dataType')} 类型角色自动加人"})
                     continue
@@ -969,11 +1041,11 @@ def main():
     # Step2
     df2 = read_sheet_with_header(xlsx, "02_费用科目配置", "一级费用科目")
     df2 = df2[df2[get_col(df2, "是否执行")].astype(str).str.strip() == "是"].copy()
-    for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目"), get_col(df2, "归属单据名称")]:
+    for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目")]:
         df2[c] = df2[c].ffill()
     # 处理四级费用科目（如果存在）
     if any("四级费用科目" in str(c) for c in df2.columns):
-        for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目"), get_col(df2, "三级费用科目"), get_col(df2, "归属单据名称")]:
+        for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目"), get_col(df2, "三级费用科目")]:
             df2[c] = df2[c].ffill()
 
     # Step2 费用科目处理流程：
@@ -995,9 +1067,9 @@ def main():
     doc_role_bindings = {}
 
     for _, row in df2.iterrows():
-        doc = str(row.get(get_col(df2, "归属单据名称"), "")).strip()
+        doc = normalize_text(row.get(get_col(df2, "归属单据名称"), ""))
         people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
-        if not doc:
+        if not (doc and people):
             continue
         has_people[doc] = has_people.get(doc, False) or bool(people)
         if doc not in doc_people_map:
@@ -1007,12 +1079,13 @@ def main():
                 doc_people_map[doc].append(person_name)
 
     for _, row in df2.iterrows():
-        p = str(row.get(get_col(df2, "一级费用科目"), "")).strip()
-        s = str(row.get(get_col(df2, "二级费用科目"), "")).strip()
-        t3 = str(row.get(get_col(df2, "三级费用科目"), "")).strip()
-        t4 = str(row.get(get_col(df2, "四级费用科目"), "")).strip() if any("四级费用科目" in str(c) for c in df2.columns) else ""
-        doc = str(row.get(get_col(df2, "归属单据名称"), "")).strip()
-        if not (p and s and doc):
+        p = normalize_text(row.get(get_col(df2, "一级费用科目"), ""))
+        s = normalize_text(row.get(get_col(df2, "二级费用科目"), ""))
+        t3 = normalize_text(row.get(get_col(df2, "三级费用科目"), ""))
+        t4 = normalize_text(row.get(get_col(df2, "四级费用科目"), "")) if any("四级费用科目" in str(c) for c in df2.columns) else ""
+        doc = normalize_text(row.get(get_col(df2, "归属单据名称"), ""))
+        people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
+        if not (p and s):
             continue
 
         primary_info = primary.get(p)
@@ -1055,7 +1128,7 @@ def main():
         fee_cache = {}
 
         # 验证三级费用科目名称（不能是纯数字或空）
-        if t3 and t3.lower() != "nan":
+        if t3:
             if t3.isdigit() or len(t3) < 2:
                 report["step2"]["relations_fail"].append({"doc": doc, "三级费用科目": t3, "message": f"三级费用科目名称 '{t3}' 无效（不能是纯数字或单个字符）"})
                 continue
@@ -1067,8 +1140,8 @@ def main():
                 continue
 
         # 四级存在时，在三级下查找或创建（如果三级不存在，则直接在二级下创建四级）
-        if t4 and t4.lower() != "nan":
-            parent_for_t4 = leaf_id if (t3 and t3.lower() != "nan") else sid
+        if t4:
+            parent_for_t4 = leaf_id if t3 else sid
             t4_id = get_or_create_fee_template(t4, parent_for_t4, company_id, h, fee_cache, invoice_component=invoice_component, template_from_id=parent_for_t4)
             if t4_id:
                 leaf_id = t4_id
@@ -1076,11 +1149,12 @@ def main():
                 report["step2"]["relations_fail"].append({"doc": doc, "四级费用科目": t4, "message": f"创建四级费用科目 '{t4}' 失败", "parent_id": parent_for_t4})
                 continue
 
-        report["step2"]["leaf_by_doc"].setdefault(doc, [])
-        if leaf_id not in report["step2"]["leaf_by_doc"][doc]:
-            report["step2"]["leaf_by_doc"][doc].append(leaf_id)
+        if doc:
+            report["step2"]["leaf_by_doc"].setdefault(doc, [])
+            if leaf_id not in report["step2"]["leaf_by_doc"][doc]:
+                report["step2"]["leaf_by_doc"][doc].append(leaf_id)
 
-        if has_people.get(doc, False):
+        if doc and people and has_people.get(doc, False):
             doc_role_bindings.setdefault(doc, {"fee_ids": set(), "user_ids": set()})
             doc_role_bindings[doc]["fee_ids"].add(leaf_id)
 
