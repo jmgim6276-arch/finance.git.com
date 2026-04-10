@@ -6,6 +6,7 @@ XLSX=""
 OUTPUT=""
 BROWSER="edge"
 USERNAME_ARG=""
+PASSWORD_ARG=""
 COMPANY_ID_ARG=""
 AUTO_UPDATE=1
 INSTALL_DEPS=1
@@ -20,6 +21,7 @@ usage() {
   --output PATH        可选，导入报告输出路径
   --browser NAME       可选，edge|chrome|auto，默认 edge
   --username VALUE     可选，财税通手机号；不传则优先用环境变量 CST_USERNAME
+  --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
   --no-update          可选，跳过 git 拉取最新代码
   --skip-install       可选，跳过 pip 安装依赖
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --username)
       USERNAME_ARG="${2:-}"
+      shift 2
+      ;;
+    --password)
+      PASSWORD_ARG="${2:-}"
       shift 2
       ;;
     --company-id)
@@ -129,6 +135,10 @@ CMD=(
 
 if [[ -n "$USERNAME_ARG" ]]; then
   CMD+=(--username "$USERNAME_ARG")
+fi
+
+if [[ -n "$PASSWORD_ARG" ]]; then
+  CMD+=(--password "$PASSWORD_ARG")
 fi
 
 if [[ -n "$COMPANY_ID_ARG" ]]; then

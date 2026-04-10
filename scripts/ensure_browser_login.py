@@ -7,6 +7,7 @@ from browser_session import get_auth
 def main():
     parser = argparse.ArgumentParser(description="自动打开浏览器并登录财税通")
     parser.add_argument("--username", help="财税通登录手机号；不传则优先读取 CST_USERNAME，仍缺失时终端提示输入")
+    parser.add_argument("--password", help="财税通登录密码；不传则优先读取 CST_PASSWORD，仍缺失时终端隐藏输入")
     parser.add_argument("--company-id", type=int, help="多企业账号时指定 companyId；也可用环境变量 CST_COMPANY_ID")
     parser.add_argument(
         "--browser",
@@ -20,6 +21,7 @@ def main():
         auto_login=True,
         preferred_browser=args.browser,
         username=args.username,
+        password=args.password,
         company_id=args.company_id,
         prompt=True,
     )

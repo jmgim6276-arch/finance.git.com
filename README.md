@@ -46,6 +46,18 @@ bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx
 
 如果你不想每次手动输入账号密码，可以在仓库根目录放一个 `.openclaw.env`，格式参考 `.openclaw.env.example`。
 
+如果你更希望每次都临时发给 OpenClaw 不同账号，也可以直接这样跑：
+
+```bash
+bash run_openclaw_import.sh \
+  --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" \
+  --username "你的手机号" \
+  --password "你的密码" \
+  --company-id "8108"
+```
+
+这种方式不会要求你固定使用 `.openclaw.env`。更适合你有多个财税通账号轮流登录的场景。
+
 ## 2.5) 新设备快速开始
 
 ```bash
