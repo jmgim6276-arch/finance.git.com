@@ -58,6 +58,25 @@ bash run_openclaw_import.sh \
 
 这种方式不会要求你固定使用 `.openclaw.env`。更适合你有多个财税通账号轮流登录的场景。
 
+## 2.2) 只登录财税通，不做导入
+
+如果你只想让 OpenClaw 先登录财税通，不和任何导入项目绑定，直接用这个独立入口：
+
+```bash
+bash run_openclaw_login.sh \
+  --username "本次要登录的手机号" \
+  --password "本次要登录的密码" \
+  --company-id "8108"
+```
+
+这个脚本只做三件事：
+
+- 拉最新 `main`
+- 安装/校验依赖
+- 自动打开浏览器并登录财税通
+
+它不会读取 Excel，也不会执行 Step1/Step2/Step3。
+
 ## 2.5) 新设备快速开始
 
 ```bash
