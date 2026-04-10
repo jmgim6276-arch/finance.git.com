@@ -31,14 +31,29 @@ python3 scripts/import_from_agent1.py \
 
 脚本会在终端里隐藏输入密码，不建议把密码写进命令行历史。
 
+如果你想给 OpenClaw 或别的电脑一个固定入口，直接用仓库根目录这个脚本：
+
+```bash
+bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx"
+```
+
+这条脚本会自动做几件事：
+
+- 优先 `git pull --ff-only origin main` 拉最新代码
+- 自动安装/校验依赖
+- 导入时强制带 `--auto-login`
+- 浏览器登录态过期时，自动重新登录财税通
+
+如果你不想每次手动输入账号密码，可以在仓库根目录放一个 `.openclaw.env`，格式参考 `.openclaw.env.example`。
+
 ## 2.5) 新设备快速开始
 
 ```bash
 git clone https://github.com/jmgim6276-arch/finance.git.com.git
 cd finance.git.com
-python3 -m pip install -r requirements.txt
-python3 scripts/ensure_browser_login.py --username "你的手机号"
-python3 scripts/preflight_check.py --auto-login --username "你的手机号"
+cp .openclaw.env.example .openclaw.env
+# 然后把 .openclaw.env 里的手机号/密码/companyId 改成你自己的
+bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx"
 ```
 
 - 如果你在 macOS 上使用系统自带 Python，看见 `urllib3` 的 LibreSSL 提示通常不影响脚本执行
@@ -100,6 +115,8 @@ python3 scripts/preflight_check.py --auto-login
 - Step3 不创建审批流，只引用 workflowId
 - 借款单/申请单不进入费用限制分支
 - Sheet2 `归属单据名称` 与 Sheet3 `单据模板名称` 必须一一对应
+- 只会识别这三张 sheet：`01_添加员工`、`02_费用科目配置`、`03_单据表`
+- 你在 Excel 后面新增无关 sheet 没关系，脚本会忽略它们
 
 ---
 

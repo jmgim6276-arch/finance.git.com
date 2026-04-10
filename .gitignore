@@ -4,3 +4,5 @@ __pycache__/
 *.report.json
 agent2_import_report*.json
 .venv/
+.openclaw.env
+.env.local
