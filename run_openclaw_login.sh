@@ -33,6 +33,24 @@ usage() {
 EOF
 }
 
+ensure_local_no_proxy() {
+  local suffix="localhost,127.0.0.1"
+  if [[ -n "${NO_PROXY:-}" ]]; then
+    export NO_PROXY="${NO_PROXY},${suffix}"
+  else
+    export NO_PROXY="${suffix}"
+  fi
+  if [[ -n "${no_proxy:-}" ]]; then
+    export no_proxy="${no_proxy},${suffix}"
+  else
+    export no_proxy="${suffix}"
+  fi
+}
+
+disable_proxy_for_python_step() {
+  unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --browser)
@@ -79,6 +97,7 @@ if [[ -f "$REPO_DIR/.openclaw.env" ]]; then
 fi
 
 cd "$REPO_DIR"
+ensure_local_no_proxy()
 
 if [[ "$AUTO_UPDATE" -eq 1 ]]; then
   if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1; then
@@ -96,6 +115,8 @@ if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   echo "==> 安装/校验依赖..."
   python3 -m pip install -r "$REPO_DIR/requirements.txt"
 fi
+
+disable_proxy_for_python_step
 
 CMD=(
   python3

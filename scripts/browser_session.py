@@ -33,6 +33,10 @@ BROWSERS = [
     },
 ]
 
+
+_LOCAL_HTTP = requests.Session()
+_LOCAL_HTTP.trust_env = False
+
 STATIC_DEFAULT_BILL_MODELS = {
     "EXPENSE": {
         "businessType": "PRIVATE",
@@ -572,7 +576,7 @@ def browser_choices(preferred="auto"):
 
 
 def list_pages(browser):
-    return requests.get(browser["url"], timeout=6).json()
+    return _LOCAL_HTTP.get(browser["url"], timeout=6).json()
 
 
 def find_browser(preferred="auto", require_cst=False):
@@ -641,7 +645,7 @@ def find_or_launch_browser(preferred="auto", target_url=LOGIN_URL):
 
 def open_target(browser, url):
     encoded = quote(url, safe=":/?&=#")
-    resp = requests.put(
+    resp = _LOCAL_HTTP.put(
         f"http://localhost:{browser['port']}/json/new?{encoded}",
         timeout=10,
     )
@@ -653,7 +657,7 @@ def activate_page(browser, page):
     if not page_id:
         return False
     try:
-        requests.get(
+        _LOCAL_HTTP.get(
             f"http://localhost:{browser['port']}/json/activate/{page_id}",
             timeout=6,
         )
@@ -667,7 +671,7 @@ def close_page(browser, page):
     if not page_id:
         return False
     try:
-        requests.get(
+        _LOCAL_HTTP.get(
             f"http://localhost:{browser['port']}/json/close/{page_id}",
             timeout=6,
         )
@@ -705,6 +709,9 @@ def cdp_eval(page, expression, return_by_value=True, await_promise=False):
         page["webSocketDebuggerUrl"],
         timeout=10,
         suppress_origin=True,
+        http_proxy_host=None,
+        http_proxy_port=None,
+        http_no_proxy=["localhost", "127.0.0.1"],
     )
     try:
         ws.send(
@@ -744,6 +751,9 @@ def cdp_navigate(page, url):
         page["webSocketDebuggerUrl"],
         timeout=10,
         suppress_origin=True,
+        http_proxy_host=None,
+        http_proxy_port=None,
+        http_no_proxy=["localhost", "127.0.0.1"],
     )
     try:
         ws.send(
