@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -43,52 +44,51 @@ def list_browser_processes(browser: dict) -> list[dict]:
         f"--remote-debugging-port={browser['port']}",
     ]
     matches: dict[int, str] = {}
-    for pattern in patterns:
-        result = subprocess.run(
-            ["pgrep", "-fal", "--", pattern],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode not in (0, 1):
-            raise RuntimeError(f"pgrep failed for {browser['name']}: {result.stderr.strip()}")
-        for raw_line in result.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            pid_text, _, cmd = line.partition(" ")
-            if not pid_text.isdigit():
-                continue
-            pid = int(pid_text)
-            if pid == os.getpid():
-                continue
+    result = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ps failed for {browser['name']}: {result.stderr.strip()}")
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        pid_text, _, cmd = line.partition(" ")
+        if not pid_text.isdigit():
+            continue
+        pid = int(pid_text)
+        if pid == os.getpid():
+            continue
+        if any(pattern in cmd for pattern in patterns):
             matches[pid] = cmd
     return [{"pid": pid, "cmd": cmd} for pid, cmd in sorted(matches.items())]
 
 
-def send_signal(browser: dict, signal_name: str) -> None:
-    patterns = [
-        browser["profile_dir"],
-        f"--remote-debugging-port={browser['port']}",
-    ]
-    for pattern in patterns:
-        subprocess.run(
-            ["pkill", f"-{signal_name}", "-f", "--", pattern],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+def send_signal(browser: dict, sig: int) -> None:
+    for process in list_browser_processes(browser):
+        try:
+            os.kill(process["pid"], sig)
+        except ProcessLookupError:
+            continue
 
 
 def wait_for_browser_exit(browser: dict, timeout: float) -> tuple[bool, list[dict], bool]:
     deadline = time.time() + timeout
     latest_processes = list_browser_processes(browser)
     latest_port_open = is_port_open(browser["port"])
+    clear_checks = 0
     while time.time() < deadline:
         latest_processes = list_browser_processes(browser)
         latest_port_open = is_port_open(browser["port"])
         if not latest_processes and not latest_port_open:
-            return True, latest_processes, latest_port_open
+            clear_checks += 1
+            if clear_checks >= 2:
+                return True, latest_processes, latest_port_open
+        else:
+            clear_checks = 0
         time.sleep(0.25)
     latest_processes = list_browser_processes(browser)
     latest_port_open = is_port_open(browser["port"])
@@ -113,13 +113,13 @@ def close_browser(browser: dict, timeout: float, dry_run: bool) -> tuple[bool, s
         parts.append(f"CDP端口 {browser['port']}: {'open' if before_port_open else 'closed'}")
         return True, " | ".join(parts)
 
-    send_signal(browser, "TERM")
+    send_signal(browser, signal.SIGTERM)
     closed, remaining_processes, remaining_port_open = wait_for_browser_exit(
         browser,
         timeout=min(timeout, 3.0),
     )
     if not closed:
-        send_signal(browser, "KILL")
+        send_signal(browser, signal.SIGKILL)
         closed, remaining_processes, remaining_port_open = wait_for_browser_exit(browser, timeout)
 
     if closed:
