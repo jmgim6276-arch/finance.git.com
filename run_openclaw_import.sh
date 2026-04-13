@@ -8,6 +8,7 @@ BROWSER="edge"
 USERNAME_ARG=""
 PASSWORD_ARG=""
 COMPANY_ID_ARG=""
+COMPANY_NAME_ARG=""
 AUTO_UPDATE=1
 INSTALL_DEPS=1
 KEEP_BROWSER=0
@@ -24,6 +25,7 @@ usage() {
   --username VALUE     可选，财税通手机号；不传则优先用环境变量 CST_USERNAME
   --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
+  --company-name VALUE 可选，期望进入的集团/公司名称；用于校验和多企业切换
   --keep-browser       可选，导入完成后保留浏览器，不自动关闭
   --no-update          可选，跳过 git 拉取最新代码
   --skip-install       可选，跳过 pip 安装依赖
@@ -81,6 +83,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --company-id)
       COMPANY_ID_ARG="${2:-}"
+      shift 2
+      ;;
+    --company-name)
+      COMPANY_NAME_ARG="${2:-}"
       shift 2
       ;;
     --keep-browser)
@@ -170,6 +176,10 @@ fi
 
 if [[ -n "$COMPANY_ID_ARG" ]]; then
   CMD+=(--company-id "$COMPANY_ID_ARG")
+fi
+
+if [[ -n "$COMPANY_NAME_ARG" ]]; then
+  CMD+=(--company-name "$COMPANY_NAME_ARG")
 fi
 
 echo "==> 开始导入..."

@@ -60,10 +60,12 @@ bash run_openclaw_import.sh \
   --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" \
   --username "你的手机号" \
   --password "你的密码" \
-  --company-id "8108"
+  --company-id "8108" \
+  --company-name "上海公司"
 ```
 
 这种方式不会要求你固定使用 `.openclaw.env`。更适合你有多个财税通账号轮流登录的场景。
+如果你只有集团/公司名称，没有 `company-id`，也建议至少传 `--company-name`，脚本会用它校验并切换目标企业，避免误复用上一次别的公司浏览器上下文。
 
 ## 2.2) 只登录财税通，不做导入
 
@@ -131,7 +133,7 @@ bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx
 - 费用角色绑定优先按完整姓名匹配，并支持自动创建费用类型角色
 - 费用科目名称匹配会自动 `strip()`，降低尾部空格导致的一级科目识别失败
 - 支持在导入前自动打开 Edge/Chrome，并通过终端隐藏输入密码自动登录财税通
-- 支持登录后自动选择企业；如果是多企业账号，可传 `--company-id`
+- 支持登录后自动选择企业；如果是多企业账号，建议同时传 `--company-id` 与 `--company-name`
 - Step3 创建单据模板后，会自动打开单据模板页并执行一次页面保存，补齐浏览器侧闭环
 
 ## 4.5) 自动登录建议

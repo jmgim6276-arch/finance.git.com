@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -1004,6 +1005,84 @@ def normalize_company_id(company_id):
     return int(company_id)
 
 
+def normalize_company_name(company_name):
+    if company_name in (None, ""):
+        return None
+    value = str(company_name).strip()
+    return value or None
+
+
+def extract_company_name(auth_data):
+    user = (auth_data or {}).get("user") or {}
+    company = user.get("company") or {}
+    for key in ["name", "companyName", "shortName", "fullName"]:
+        value = normalize_company_name(company.get(key))
+        if value:
+            return value
+    return None
+
+
+def company_matches(selected_company_id, desired_company_id, selected_company_name=None, desired_company_name=None):
+    desired_company_id = normalize_company_id(desired_company_id)
+    desired_company_name = normalize_company_name(desired_company_name)
+    selected_company_id = normalize_company_id(selected_company_id)
+    selected_company_name = normalize_company_name(selected_company_name)
+    if desired_company_id is not None and selected_company_id != desired_company_id:
+        return False
+    if desired_company_name is not None and selected_company_name != desired_company_name:
+        return False
+    return desired_company_id is None and desired_company_name is None or True
+
+
+def open_company_selector(page):
+    return cdp_eval(
+        page,
+        f"""
+        (() => {{
+          location.replace({json.dumps(LOGIN_URL)});
+          return true;
+        }})()
+        """,
+    )
+
+
+def wait_for_company_selector(page, timeout=15):
+    def _ready():
+        raw = cdp_eval(
+            page,
+            """
+            (() => JSON.stringify({
+              url: location.href,
+              cardCount: document.querySelectorAll('.comp').length,
+              hasEnterButton: [...document.querySelectorAll('button')]
+                .some(btn => (btn.innerText || '').includes('进入企业'))
+            }))()
+            """,
+        )
+        try:
+            info = json.loads(raw or "{}")
+        except Exception:
+            return None
+        if info.get("cardCount") or info.get("hasEnterButton"):
+            return info
+        return None
+
+    return wait_for(_ready, timeout=timeout, interval=1)
+
+
+def reset_automation_browser(preferred_browser="auto"):
+    script_path = Path(__file__).with_name("close_cst_browser.py")
+    if not script_path.exists():
+        raise RuntimeError(f"关闭脚本不存在：{script_path}")
+
+    cmd = [sys.executable or "python3", str(script_path), "--browser", preferred_browser]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = (result.stdout or result.stderr or "").strip()
+        raise RuntimeError(f"重置自动化浏览器失败：{detail or '未知错误'}")
+    return result.stdout.strip()
+
+
 def read_credentials(username=None, password=None, company_id=None, prompt=False):
     username = username or os.getenv("CST_USERNAME")
     password = password or os.getenv("CST_PASSWORD")
@@ -1123,13 +1202,22 @@ def query_user_companies(token):
     return resp.get("result") or []
 
 
-def choose_company(companies, desired_company_id=None):
+def choose_company(companies, desired_company_id=None, desired_company_name=None):
     desired_company_id = normalize_company_id(desired_company_id)
+    desired_company_name = normalize_company_name(desired_company_name)
     if desired_company_id:
         for company in companies:
             if int(company.get("id")) == desired_company_id:
                 return company
         raise RuntimeError(f"未在企业列表中找到 companyId={desired_company_id}")
+    if desired_company_name:
+        for company in companies:
+            company_name = normalize_company_name(
+                company.get("name") or company.get("companyName") or company.get("shortName")
+            )
+            if company_name == desired_company_name:
+                return company
+        raise RuntimeError(f"未在企业列表中找到公司名={desired_company_name}")
     if len(companies) == 1:
         return companies[0]
     raise RuntimeError("检测到多个企业，请通过 --company-id 或 CST_COMPANY_ID 指定导入企业")
@@ -1157,20 +1245,44 @@ def click_company_entry(page, company_name):
     return json.loads(result or "{}")
 
 
-def ensure_company_selected(page, desired_company_id=None):
-    token, current_company_id, _, _ = extract_auth(page)
-    if current_company_id:
+def ensure_company_selected(page, desired_company_id=None, desired_company_name=None):
+    desired_company_id = normalize_company_id(desired_company_id)
+    desired_company_name = normalize_company_name(desired_company_name)
+    token, current_company_id, _, auth_data = extract_auth(page)
+    current_company_id = normalize_company_id(current_company_id)
+    current_company_name = extract_company_name(auth_data)
+    if current_company_id and company_matches(
+        current_company_id,
+        desired_company_id,
+        current_company_name,
+        desired_company_name,
+    ):
         return token, current_company_id
+    if current_company_id and (desired_company_id or desired_company_name):
+        open_company_selector(page)
+        if not wait_for_company_selector(page, timeout=15):
+            raise RuntimeError(
+                f"当前浏览器企业为 companyId={current_company_id}，无法切换到期望企业"
+            )
 
     companies = query_user_companies(token)
-    company = choose_company(companies, desired_company_id=desired_company_id)
+    company = choose_company(
+        companies,
+        desired_company_id=desired_company_id,
+        desired_company_name=desired_company_name,
+    )
     click = click_company_entry(page, company["name"])
     if not click.get("ok"):
         raise RuntimeError(f"进入企业失败：{click}")
 
     def _selected():
-        token2, company_id2, _, _ = extract_auth(page)
-        if token2 and company_id2 and int(company_id2) == int(company["id"]):
+        token2, company_id2, _, auth_data2 = extract_auth(page)
+        if token2 and company_matches(
+            company_id2,
+            company.get("id"),
+            extract_company_name(auth_data2),
+            company.get("name") or company.get("companyName") or company.get("shortName"),
+        ):
             return token2, int(company_id2)
         return None
 
@@ -1376,21 +1488,41 @@ def ensure_login(
     username=None,
     password=None,
     company_id=None,
+    company_name=None,
     prompt=False,
 ):
+    desired_company_id = normalize_company_id(company_id)
+    desired_company_name = normalize_company_name(company_name)
     browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
     if not browser:
         raise RuntimeError("未能自动打开 Edge/Chrome，请确认本机已安装浏览器")
 
     page = ensure_cst_page(browser, url=LOGIN_URL)
-    token, selected_company_id, user_id, _ = extract_auth(page)
-    if validate_auth(token, selected_company_id):
+    token, selected_company_id, user_id, auth_data = extract_auth(page)
+    selected_company_name = extract_company_name(auth_data)
+    if validate_auth(token, selected_company_id) and company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
         return token, selected_company_id, user_id, browser["name"]
+    if validate_auth(token, selected_company_id) and (desired_company_id or desired_company_name) and not company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
+        reset_automation_browser(preferred_browser=preferred_browser)
+        browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+        if not browser:
+            raise RuntimeError("重置浏览器后未能重新打开 Edge/Chrome")
+        page = ensure_cst_page(browser, url=LOGIN_URL)
 
     username, password, company_id = read_credentials(
         username=username,
         password=password,
-        company_id=company_id,
+        company_id=desired_company_id,
         prompt=prompt,
     )
     if not username or not password:
@@ -1417,11 +1549,33 @@ def ensure_login(
         raise RuntimeError("自动登录后未能读取到 token，请检查账号密码是否正确")
 
     token, selected_company_id, user_id = logged_in
-    if not selected_company_id:
-        token, selected_company_id = ensure_company_selected(page, desired_company_id=company_id)
+    token, selected_company_id, user_id, auth_data = extract_auth(page)
+    selected_company_name = extract_company_name(auth_data)
+    if not company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
+        token, selected_company_id = ensure_company_selected(
+            page,
+            desired_company_id=desired_company_id,
+            desired_company_name=desired_company_name,
+        )
+        token, selected_company_id, user_id, auth_data = extract_auth(page)
+        selected_company_name = extract_company_name(auth_data)
 
     if not validate_auth(token, selected_company_id):
         raise RuntimeError("自动登录完成，但登录态校验未通过")
+    if not company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
+        raise RuntimeError(
+            f"自动登录后进入的企业为 companyId={selected_company_id}，与期望企业不一致"
+        )
 
     return token, selected_company_id, user_id, browser["name"]
 
@@ -1432,8 +1586,11 @@ def get_auth(
     username=None,
     password=None,
     company_id=None,
+    company_name=None,
     prompt=False,
 ):
+    desired_company_id = normalize_company_id(company_id)
+    desired_company_name = normalize_company_name(company_name)
     browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
     if not browser:
         raise RuntimeError(
@@ -1441,9 +1598,25 @@ def get_auth(
         )
 
     page = ensure_cst_page(browser, url=LOGIN_URL)
-    token, selected_company_id, user_id, _ = extract_auth(page)
-    if validate_auth(token, selected_company_id):
+    token, selected_company_id, user_id, auth_data = extract_auth(page)
+    selected_company_name = extract_company_name(auth_data)
+    if validate_auth(token, selected_company_id) and company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
         return token, selected_company_id, user_id, browser["name"]
+    if validate_auth(token, selected_company_id) and (desired_company_id or desired_company_name) and not company_matches(
+        selected_company_id,
+        desired_company_id,
+        selected_company_name,
+        desired_company_name,
+    ):
+        if not auto_login:
+            raise RuntimeError(
+                f"当前浏览器企业为 companyId={selected_company_id}，与期望企业不一致，请重新登录或使用 --auto-login"
+            )
 
     if not auto_login:
         raise RuntimeError(
@@ -1454,6 +1627,7 @@ def get_auth(
         preferred_browser=preferred_browser,
         username=username,
         password=password,
-        company_id=company_id,
+        company_id=desired_company_id,
+        company_name=desired_company_name,
         prompt=prompt,
     )

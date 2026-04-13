@@ -143,6 +143,16 @@ def get_fee_template_detail(fee_id, company_id, headers):
     return None
 
 
+def wait_for_fee_template_detail(fee_id, company_id, headers, attempts=4, delay=0.8):
+    for attempt in range(max(1, attempts)):
+        detail = get_fee_template_detail(fee_id, company_id, headers)
+        if detail:
+            return detail
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return None
+
+
 def build_fee_create_payload(name, parent_id, company_id, headers, template_from_id=None, invoice_component=None):
     payload = {"name": name, "parentId": parent_id, "companyId": company_id}
     if template_from_id:
@@ -198,7 +208,7 @@ def get_or_create_fee_template(
             new_id = new_id.get("id") or new_id.get("result")
         if new_id:
             new_id = int(new_id)
-            if get_fee_template_detail(new_id, company_id, headers):
+            if wait_for_fee_template_detail(new_id, company_id, headers):
                 created_cache[cache_key] = new_id
                 return new_id
 
@@ -220,7 +230,7 @@ def get_or_create_fee_template(
             return None
 
         existing_id = walk(fee_tree_retry)
-        if existing_id and get_fee_template_detail(existing_id, company_id, headers):
+        if existing_id and wait_for_fee_template_detail(existing_id, company_id, headers):
             created_cache[cache_key] = existing_id
             return existing_id
 
@@ -889,6 +899,66 @@ def build_template_name_id_map(tree):
     return name_to_id
 
 
+def query_template_tree(company_id, headers):
+    return (
+        requests.get(
+            f"{BASE_URL}/api/bill/template/queryTemplateTree",
+            headers=headers,
+            params={"companyId": company_id},
+            timeout=12,
+        ).json().get("result", [])
+        or []
+    )
+
+
+def find_template_id_by_name(doc_name, company_id, headers, retries=4, delay=0.8):
+    for attempt in range(max(1, retries)):
+        name_map = build_template_name_id_map(query_template_tree(company_id, headers))
+        template_id = name_map.get(doc_name)
+        if template_id:
+            return template_id
+        if attempt + 1 < retries:
+            time.sleep(delay)
+    return None
+
+
+def verify_template_persisted(doc_name, company_id, headers):
+    template_id = find_template_id_by_name(doc_name, company_id, headers)
+    if not template_id:
+        return None
+    template = query_bill_template(template_id, company_id, headers)
+    if not template:
+        return None
+    return {
+        "templateId": template_id,
+        "templateName": template.get("name") or doc_name,
+        "message": "页面保存未拿到成功提示，但后台已能读取模板",
+    }
+
+
+def ui_save_bill_template_with_retry(doc_name, company_id, headers, preferred_browser="auto", reload_page=False, attempts=3):
+    errors = []
+    for attempt in range(max(1, attempts)):
+        try:
+            result = ui_save_bill_template(
+                doc_name,
+                preferred_browser=preferred_browser,
+                reload_page=(reload_page or attempt > 0),
+            )
+            result["attempt"] = attempt + 1
+            return "ok", result, errors
+        except Exception as exc:
+            errors.append(str(exc))
+            if attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+
+    persisted = verify_template_persisted(doc_name, company_id, headers)
+    if persisted:
+        persisted["attempt"] = attempts
+        return "warning", persisted, errors
+    return "fail", None, errors
+
+
 def read_sheet_with_header(path: Path, sheet: str, header_key: str):
     workbook = load_workbook(path, data_only=True)
     worksheet = workbook[sheet]
@@ -956,6 +1026,7 @@ def main():
     parser.add_argument("--username", help="财税通登录手机号；不传则优先读取 CST_USERNAME，仍缺失时终端提示输入")
     parser.add_argument("--password", help="财税通登录密码；不传则优先读取 CST_PASSWORD，仍缺失时终端隐藏输入")
     parser.add_argument("--company-id", type=int, help="多企业账号时指定 companyId；也可用环境变量 CST_COMPANY_ID")
+    parser.add_argument("--company-name", help="期望进入的集团/公司名称；用于校验和多企业切换")
     parser.add_argument(
         "--browser",
         choices=["auto", "edge", "chrome"],
@@ -971,6 +1042,7 @@ def main():
         username=args.username,
         password=args.password,
         company_id=args.company_id,
+        company_name=args.company_name,
         prompt=args.auto_login,
     )
     print(f"✅ 检测到 {browser_name} 浏览器")
@@ -979,6 +1051,7 @@ def main():
     report = {
         "companyId": company_id,
         "xlsx": str(xlsx),
+        "preflight": {"has_risk": False, "missing_primary": [], "missing_people": [], "doc_mismatch_02_only": [], "doc_mismatch_03_only": []},
         "step1": {"ok": 0, "fail": []},
         "step1_department_sync": {"ok": 0, "fail": []},
         "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}, "created_roles": []},
@@ -993,6 +1066,7 @@ def main():
             "default_model_ok": [],
             "default_model_fail": [],
             "ui_save_ok": [],
+            "ui_save_warn": [],
             "ui_save_fail": [],
         },
     }
@@ -1075,6 +1149,7 @@ def main():
         for name in sorted(existing_primary.keys()):
             print(f"      - {name}")
         has_error = True
+        report["preflight"]["missing_primary"] = missing_primary
     else:
         print(f"   ✅ 所有一级费用科目都存在")
     
@@ -1098,6 +1173,7 @@ def main():
         for name in sorted(existing_user_names.keys())[:15]:
             print(f"      - {name}")
         has_error = True
+        report["preflight"]["missing_people"] = missing_people
     else:
         print(f"   ✅ 所有 {len(checked_people)} 名单据适配人员都存在")
 
@@ -1145,25 +1221,20 @@ def main():
         print(f"\n   ⚠️  02表中有但03表中没有的单据名称：")
         for d in mismatch:
             print(f"      - {d}")
-    
+        report["preflight"]["doc_mismatch_02_only"] = sorted(mismatch)
+
     mismatch2 = doc_names_from_03 - doc_names_from_02
     if mismatch2:
         print(f"\n   ⚠️  03表中有但02表中没有的单据名称：")
         for d in mismatch2:
             print(f"      - {d}")
+        report["preflight"]["doc_mismatch_03_only"] = sorted(mismatch2)
     
-    # 如果有错误，报告并退出
-    if False:  # 跳过检查
+    report["preflight"]["has_risk"] = has_error
+    if has_error:
         print("\n" + "="*50)
-        print("❌ 数据核对失败，请先修正Excel中的数据！")
+        print("⚠️ 数据核对发现风险，将继续导入并在报告中保留这些风险项")
         print("="*50)
-        report["step2"]["relations_fail"].append({
-            "检查": "数据核对",
-            "缺失一级科目": missing_primary if missing_primary else [],
-            "缺失人员": missing_people if missing_people else []
-        })
-        Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return
     else:
         print("\n" + "="*50)
         print("✅ 数据核对通过！")
@@ -1805,23 +1876,44 @@ def main():
     if created_docs:
         print("\n7️⃣ 页面保存闭环...")
         for idx, doc_name in enumerate(created_docs):
-            try:
-                save_result = ui_save_bill_template(
-                    doc_name,
-                    preferred_browser=args.browser,
-                    reload_page=(idx == 0),
-                )
+            save_status, save_result, save_errors = ui_save_bill_template_with_retry(
+                doc_name,
+                company_id,
+                h,
+                preferred_browser=args.browser,
+                reload_page=(idx == 0),
+                attempts=3,
+            )
+            if save_status == "ok":
                 report["step3"]["ui_save_ok"].append(
                     {
                         "doc": doc_name,
                         "message": save_result.get("message"),
                         "templateId": save_result.get("templateId"),
+                        "attempt": save_result.get("attempt"),
                     }
                 )
                 print(f"   ✅ 已页面保存：{doc_name}")
-            except Exception as exc:
-                report["step3"]["ui_save_fail"].append({"doc": doc_name, "message": str(exc)})
-                print(f"   ❌ 页面保存失败：{doc_name} -> {exc}")
+                continue
+            if save_status == "warning":
+                report["step3"]["ui_save_warn"].append(
+                    {
+                        "doc": doc_name,
+                        "message": save_result.get("message"),
+                        "templateId": save_result.get("templateId"),
+                        "errors": save_errors,
+                    }
+                )
+                print(f"   ⚠️ 页面保存告警：{doc_name} -> {save_result.get('message')}")
+                continue
+
+            report["step3"]["ui_save_fail"].append(
+                {
+                    "doc": doc_name,
+                    "message": "；".join(save_errors) if save_errors else "页面保存失败",
+                }
+            )
+            print(f"   ❌ 页面保存失败：{doc_name} -> {'；'.join(save_errors) if save_errors else '未知错误'}")
 
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print("✅ 导入完成")
