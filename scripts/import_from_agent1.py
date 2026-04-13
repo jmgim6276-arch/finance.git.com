@@ -936,7 +936,15 @@ def verify_template_persisted(doc_name, company_id, headers):
     }
 
 
-def ui_save_bill_template_with_retry(doc_name, company_id, headers, preferred_browser="auto", reload_page=False, attempts=3):
+def ui_save_bill_template_with_retry(
+    doc_name,
+    company_id,
+    headers,
+    preferred_browser="auto",
+    reload_page=False,
+    attempts=3,
+    task_id=None,
+):
     errors = []
     for attempt in range(max(1, attempts)):
         try:
@@ -944,6 +952,7 @@ def ui_save_bill_template_with_retry(doc_name, company_id, headers, preferred_br
                 doc_name,
                 preferred_browser=preferred_browser,
                 reload_page=(reload_page or attempt > 0),
+                task_id=task_id,
             )
             result["attempt"] = attempt + 1
             return "ok", result, errors
@@ -1027,6 +1036,7 @@ def main():
     parser.add_argument("--password", help="财税通登录密码；不传则优先读取 CST_PASSWORD，仍缺失时终端隐藏输入")
     parser.add_argument("--company-id", type=int, help="多企业账号时指定 companyId；也可用环境变量 CST_COMPANY_ID")
     parser.add_argument("--company-name", help="期望进入的集团/公司名称；用于校验和多企业切换")
+    parser.add_argument("--task-id", help="任务隔离 ID；同一 taskId 会复用同一浏览器实例")
     parser.add_argument(
         "--browser",
         choices=["auto", "edge", "chrome"],
@@ -1044,11 +1054,13 @@ def main():
         company_id=args.company_id,
         company_name=args.company_name,
         prompt=args.auto_login,
+        task_id=args.task_id,
     )
     print(f"✅ 检测到 {browser_name} 浏览器")
     h = {"x-token": token, "Content-Type": "application/json"}
 
     report = {
+        "taskId": args.task_id,
         "companyId": company_id,
         "xlsx": str(xlsx),
         "preflight": {"has_risk": False, "missing_primary": [], "missing_people": [], "doc_mismatch_02_only": [], "doc_mismatch_03_only": []},
@@ -1771,6 +1783,7 @@ def main():
                     preferred_browser=args.browser,
                     group_id=group_map.get(group_name) or 0,
                     fresh_page=False,
+                    task_id=args.task_id,
                 )
                 report["step3"]["default_model_ok"].append(
                     {
@@ -1883,6 +1896,7 @@ def main():
                 preferred_browser=args.browser,
                 reload_page=(idx == 0),
                 attempts=3,
+                task_id=args.task_id,
             )
             if save_status == "ok":
                 report["step3"]["ui_save_ok"].append(
@@ -1918,6 +1932,7 @@ def main():
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print("✅ 导入完成")
     print(json.dumps({
+        "task_id": args.task_id,
         "step1_ok": report["step1"]["ok"],
         "step1_roles_ok": report["step1_roles"]["ok"],
         "step2_relations_ok": report["step2"]["relations_ok"],

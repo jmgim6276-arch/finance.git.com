@@ -12,27 +12,12 @@ from urllib.parse import quote
 
 import requests
 import websocket
+from runtime_context import browser_choices as runtime_browser_choices
+from runtime_context import release_browser_runtime
 
 BASE_URL = "https://cst.uf-tree.com"
 LOGIN_URL = f"{BASE_URL}/login"
 BILL_TEMPLATE_URL = f"{BASE_URL}/bill/bills"
-
-BROWSERS = [
-    {
-        "name": "Edge",
-        "port": 9223,
-        "url": "http://localhost:9223/json",
-        "binary": "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "profile_dir": str(Path.home() / ".finance-cst" / "edge-cdp-profile"),
-    },
-    {
-        "name": "Chrome",
-        "port": 18800,
-        "url": "http://localhost:18800/json",
-        "binary": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "profile_dir": str(Path.home() / ".finance-cst" / "chrome-cdp-profile"),
-    },
-]
 
 
 _LOCAL_HTTP = requests.Session()
@@ -567,22 +552,17 @@ def sha1_hex(value):
     return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
-def browser_choices(preferred="auto"):
-    preferred = (preferred or "auto").lower()
-    if preferred == "edge":
-        return [b for b in BROWSERS if b["name"] == "Edge"]
-    if preferred == "chrome":
-        return [b for b in BROWSERS if b["name"] == "Chrome"]
-    return BROWSERS
+def browser_choices(preferred="auto", task_id=None):
+    return runtime_browser_choices(preferred=preferred, task_id=task_id)
 
 
 def list_pages(browser):
     return _LOCAL_HTTP.get(browser["url"], timeout=6).json()
 
 
-def find_browser(preferred="auto", require_cst=False):
+def find_browser(preferred="auto", require_cst=False, task_id=None):
     available = []
-    for browser in browser_choices(preferred):
+    for browser in browser_choices(preferred, task_id=task_id):
         try:
             pages = list_pages(browser)
             has_cst = any("cst.uf-tree.com" in p.get("url", "") for p in pages)
@@ -611,8 +591,8 @@ def wait_for_browser(browser, timeout=20):
     return False
 
 
-def launch_browser(preferred="auto", target_url=LOGIN_URL):
-    for browser in browser_choices(preferred):
+def launch_browser(preferred="auto", target_url=LOGIN_URL, task_id=None):
+    for browser in browser_choices(preferred, task_id=task_id):
         binary = Path(browser["binary"])
         if not binary.exists():
             continue
@@ -637,11 +617,11 @@ def launch_browser(preferred="auto", target_url=LOGIN_URL):
     return None
 
 
-def find_or_launch_browser(preferred="auto", target_url=LOGIN_URL):
-    browser = find_browser(preferred=preferred, require_cst=False)
+def find_or_launch_browser(preferred="auto", target_url=LOGIN_URL, task_id=None):
+    browser = find_browser(preferred=preferred, require_cst=False, task_id=task_id)
     if browser:
         return browser
-    return launch_browser(preferred=preferred, target_url=target_url)
+    return launch_browser(preferred=preferred, target_url=target_url, task_id=task_id)
 
 
 def open_target(browser, url):
@@ -928,8 +908,8 @@ def get_default_bill_model_on_page(page, bill_type, group_id=0):
     return info.get("bill") or {}
 
 
-def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False):
-    browser = find_browser(preferred=preferred_browser, require_cst=True)
+def get_default_bill_model(bill_type, preferred_browser="auto", group_id=0, fresh_page=False, task_id=None):
+    browser = find_browser(preferred=preferred_browser, require_cst=True, task_id=task_id)
     if not browser:
         fallback = get_static_default_bill_model(bill_type, group_id=group_id)
         if fallback:
@@ -1070,16 +1050,20 @@ def wait_for_company_selector(page, timeout=15):
     return wait_for(_ready, timeout=timeout, interval=1)
 
 
-def reset_automation_browser(preferred_browser="auto"):
+def reset_automation_browser(preferred_browser="auto", task_id=None):
     script_path = Path(__file__).with_name("close_cst_browser.py")
     if not script_path.exists():
         raise RuntimeError(f"关闭脚本不存在：{script_path}")
 
     cmd = [sys.executable or "python3", str(script_path), "--browser", preferred_browser]
+    if task_id:
+        cmd.extend(["--task-id", str(task_id)])
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         detail = (result.stdout or result.stderr or "").strip()
         raise RuntimeError(f"重置自动化浏览器失败：{detail or '未知错误'}")
+    if task_id:
+        release_browser_runtime(task_id, browser_id=None if preferred_browser == "auto" else preferred_browser)
     return result.stdout.strip()
 
 
@@ -1475,8 +1459,8 @@ def ui_save_bill_template_on_page(page, doc_name):
     }
 
 
-def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False):
-    browser = find_browser(preferred=preferred_browser, require_cst=True)
+def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False, task_id=None):
+    browser = find_browser(preferred=preferred_browser, require_cst=True, task_id=task_id)
     if not browser:
         raise RuntimeError("未找到已登录的财税通浏览器页面，无法执行页面保存")
     page = ensure_bill_template_page(browser, reload_page=reload_page)
@@ -1490,10 +1474,11 @@ def ensure_login(
     company_id=None,
     company_name=None,
     prompt=False,
+    task_id=None,
 ):
     desired_company_id = normalize_company_id(company_id)
     desired_company_name = normalize_company_name(company_name)
-    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL, task_id=task_id)
     if not browser:
         raise RuntimeError("未能自动打开 Edge/Chrome，请确认本机已安装浏览器")
 
@@ -1513,8 +1498,8 @@ def ensure_login(
         selected_company_name,
         desired_company_name,
     ):
-        reset_automation_browser(preferred_browser=preferred_browser)
-        browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+        reset_automation_browser(preferred_browser=preferred_browser, task_id=task_id)
+        browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL, task_id=task_id)
         if not browser:
             raise RuntimeError("重置浏览器后未能重新打开 Edge/Chrome")
         page = ensure_cst_page(browser, url=LOGIN_URL)
@@ -1588,10 +1573,11 @@ def get_auth(
     company_id=None,
     company_name=None,
     prompt=False,
+    task_id=None,
 ):
     desired_company_id = normalize_company_id(company_id)
     desired_company_name = normalize_company_name(company_name)
-    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL)
+    browser = find_or_launch_browser(preferred=preferred_browser, target_url=LOGIN_URL, task_id=task_id)
     if not browser:
         raise RuntimeError(
             "未检测到可用的浏览器。请安装 Edge 或 Chrome，或使用 --auto-login 让脚本自动打开浏览器。"
@@ -1630,4 +1616,5 @@ def get_auth(
         company_id=desired_company_id,
         company_name=desired_company_name,
         prompt=prompt,
+        task_id=task_id,
     )

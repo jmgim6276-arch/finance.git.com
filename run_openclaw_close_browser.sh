@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROWSER="auto"
+TASK_ID=""
 AUTO_UPDATE=0
 DRY_RUN=0
 TIMEOUT="5"
@@ -14,6 +15,7 @@ usage() {
 
 选项：
   --browser NAME       可选，auto|edge|chrome，默认 auto
+  --task-id VALUE      可选，任务隔离 ID；传入后只关闭该任务对应的浏览器实例
   --timeout SECONDS    可选，关闭后验证秒数，默认 5
   --dry-run            可选，只检测，不实际关闭
   --update             可选，执行前显式 git 拉取最新代码
@@ -30,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --timeout)
       TIMEOUT="${2:-}"
+      shift 2
+      ;;
+    --task-id)
+      TASK_ID="${2:-}"
       shift 2
       ;;
     --dry-run)
@@ -76,6 +82,10 @@ CMD=(
   --browser "$BROWSER"
   --timeout "$TIMEOUT"
 )
+
+if [[ -n "$TASK_ID" ]]; then
+  CMD+=(--task-id "$TASK_ID")
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   CMD+=(--dry-run)

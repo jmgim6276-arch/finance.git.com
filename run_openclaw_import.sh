@@ -9,6 +9,7 @@ USERNAME_ARG=""
 PASSWORD_ARG=""
 COMPANY_ID_ARG=""
 COMPANY_NAME_ARG=""
+TASK_ID=""
 AUTO_UPDATE=0
 INSTALL_DEPS=0
 KEEP_BROWSER=0
@@ -26,6 +27,7 @@ usage() {
   --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
   --company-name VALUE 可选，期望进入的集团/公司名称；用于校验和多企业切换
+  --task-id VALUE      可选，任务隔离 ID；不传则自动生成独立浏览器实例标识
   --keep-browser       可选，导入完成后保留浏览器，不自动关闭
   --update             可选，执行前显式 git 拉取最新代码
   --install            可选，执行前显式安装/校验依赖
@@ -61,6 +63,14 @@ disable_proxy_for_python_step() {
   unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy
 }
 
+default_task_id() {
+  printf 'task-%s-%s' "$(date +%Y%m%d_%H%M%S)" "$$"
+}
+
+sanitize_task_id() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-80
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --xlsx)
@@ -89,6 +99,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --company-name)
       COMPANY_NAME_ARG="${2:-}"
+      shift 2
+      ;;
+    --task-id)
+      TASK_ID="${2:-}"
       shift 2
       ;;
     --keep-browser)
@@ -141,8 +155,16 @@ if [[ ! -f "$XLSX" ]]; then
   exit 2
 fi
 
+if [[ -z "$TASK_ID" ]]; then
+  TASK_ID="$(default_task_id)"
+fi
+TASK_ID="$(sanitize_task_id "$TASK_ID")"
+if [[ -z "$TASK_ID" ]]; then
+  TASK_ID="$(default_task_id)"
+fi
+
 if [[ -z "$OUTPUT" ]]; then
-  OUTPUT="$REPO_DIR/agent2_import_report_$(date +%Y%m%d_%H%M%S).json"
+  OUTPUT="$REPO_DIR/agent2_import_report_${TASK_ID}_$(date +%Y%m%d_%H%M%S).json"
 fi
 
 cd "$REPO_DIR"
@@ -159,6 +181,7 @@ if [[ "$AUTO_UPDATE" -eq 1 ]]; then
 fi
 
 echo "==> 当前版本: $(git log -1 --oneline 2>/dev/null || echo '非 git 仓库')"
+echo "==> 任务隔离 ID: $TASK_ID"
 
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   echo "==> 安装/校验依赖..."
@@ -174,6 +197,7 @@ CMD=(
   --output "$OUTPUT"
   --auto-login
   --browser "$BROWSER"
+  --task-id "$TASK_ID"
 )
 
 if [[ -n "$USERNAME_ARG" ]]; then
@@ -232,7 +256,7 @@ print("导入报告校验通过，可自动关闭浏览器")
 PY
 then
   echo "==> 导入结果校验通过，关闭财税通自动化浏览器..."
-  if bash "$REPO_DIR/run_openclaw_close_browser.sh" --browser "$BROWSER" --no-update; then
+  if bash "$REPO_DIR/run_openclaw_close_browser.sh" --browser "$BROWSER" --task-id "$TASK_ID" --no-update; then
     echo "==> 导入成功，浏览器已关闭"
   else
     echo "==> 导入成功，但浏览器关闭失败，请检查上面的错误信息" >&2

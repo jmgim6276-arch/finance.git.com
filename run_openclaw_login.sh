@@ -6,6 +6,8 @@ BROWSER="edge"
 USERNAME_ARG=""
 PASSWORD_ARG=""
 COMPANY_ID_ARG=""
+COMPANY_NAME_ARG=""
+TASK_ID=""
 AUTO_UPDATE=0
 INSTALL_DEPS=0
 
@@ -19,6 +21,8 @@ usage() {
   --username VALUE     可选，财税通手机号；不传则优先用环境变量 CST_USERNAME
   --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
+  --company-name VALUE 可选，期望进入的集团/公司名称；用于校验和多企业切换
+  --task-id VALUE      可选，任务隔离 ID；不传则自动生成独立浏览器实例标识
   --update             可选，执行前显式 git 拉取最新代码
   --install            可选，执行前显式安装/校验依赖
   --no-update          可选，兼容旧参数；当前默认就不拉取
@@ -53,6 +57,14 @@ disable_proxy_for_python_step() {
   unset HTTPS_PROXY HTTP_PROXY ALL_PROXY https_proxy http_proxy all_proxy
 }
 
+default_task_id() {
+  printf 'login-%s-%s' "$(date +%Y%m%d_%H%M%S)" "$$"
+}
+
+sanitize_task_id() {
+  printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | cut -c1-80
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --browser)
@@ -69,6 +81,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --company-id)
       COMPANY_ID_ARG="${2:-}"
+      shift 2
+      ;;
+    --company-name)
+      COMPANY_NAME_ARG="${2:-}"
+      shift 2
+      ;;
+    --task-id)
+      TASK_ID="${2:-}"
       shift 2
       ;;
     --update)
@@ -106,6 +126,14 @@ if [[ -f "$REPO_DIR/.openclaw.env" ]]; then
   set +a
 fi
 
+if [[ -z "$TASK_ID" ]]; then
+  TASK_ID="$(default_task_id)"
+fi
+TASK_ID="$(sanitize_task_id "$TASK_ID")"
+if [[ -z "$TASK_ID" ]]; then
+  TASK_ID="$(default_task_id)"
+fi
+
 cd "$REPO_DIR"
 ensure_local_no_proxy()
 
@@ -120,6 +148,7 @@ if [[ "$AUTO_UPDATE" -eq 1 ]]; then
 fi
 
 echo "==> 当前版本: $(git log -1 --oneline 2>/dev/null || echo '非 git 仓库')"
+echo "==> 任务隔离 ID: $TASK_ID"
 
 if [[ "$INSTALL_DEPS" -eq 1 ]]; then
   echo "==> 安装/校验依赖..."
@@ -132,6 +161,7 @@ CMD=(
   python3
   "$REPO_DIR/scripts/ensure_browser_login.py"
   --browser "$BROWSER"
+  --task-id "$TASK_ID"
 )
 
 if [[ -n "$USERNAME_ARG" ]]; then
@@ -144,6 +174,10 @@ fi
 
 if [[ -n "$COMPANY_ID_ARG" ]]; then
   CMD+=(--company-id "$COMPANY_ID_ARG")
+fi
+
+if [[ -n "$COMPANY_NAME_ARG" ]]; then
+  CMD+=(--company-name "$COMPANY_NAME_ARG")
 fi
 
 echo "==> 开始登录财税通..."

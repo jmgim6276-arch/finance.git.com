@@ -6,30 +6,9 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 
-BROWSERS = [
-    {
-        "id": "edge",
-        "name": "Edge",
-        "port": 9223,
-        "profile_dir": str(Path.home() / ".finance-cst" / "edge-cdp-profile"),
-    },
-    {
-        "id": "chrome",
-        "name": "Chrome",
-        "port": 18800,
-        "profile_dir": str(Path.home() / ".finance-cst" / "chrome-cdp-profile"),
-    },
-]
-
-
-def browser_choices(preferred: str):
-    if preferred == "edge":
-        return [browser for browser in BROWSERS if browser["id"] == "edge"]
-    if preferred == "chrome":
-        return [browser for browser in BROWSERS if browser["id"] == "chrome"]
-    return BROWSERS
+from runtime_context import browser_choices
+from runtime_context import release_browser_runtime
 
 
 def is_port_open(port: int) -> bool:
@@ -149,6 +128,10 @@ def main() -> int:
         help="强制关闭后的验证等待秒数，默认 5",
     )
     parser.add_argument(
+        "--task-id",
+        help="任务隔离 ID；传入后只关闭该任务对应的浏览器实例",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="只检测目标，不实际关闭",
@@ -157,10 +140,16 @@ def main() -> int:
 
     messages: list[str] = []
     all_ok = True
-    for browser in browser_choices(args.browser):
+    target_browsers = browser_choices(args.browser, task_id=args.task_id, create=not args.dry_run)
+    if not target_browsers and args.task_id:
+        print(f"ℹ️ taskId={args.task_id} 当前没有已登记的浏览器实例")
+        return 0
+    for browser in target_browsers:
         ok, message = close_browser(browser, timeout=max(args.timeout, 0.5), dry_run=args.dry_run)
         messages.append(message)
         all_ok = all_ok and ok
+        if ok and not args.dry_run and args.task_id:
+            release_browser_runtime(args.task_id, browser_id=browser["id"])
 
     for message in messages:
         print(message)
