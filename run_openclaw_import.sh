@@ -10,6 +10,7 @@ PASSWORD_ARG=""
 COMPANY_ID_ARG=""
 AUTO_UPDATE=1
 INSTALL_DEPS=1
+KEEP_BROWSER=0
 
 usage() {
   cat <<'EOF'
@@ -23,6 +24,7 @@ usage() {
   --username VALUE     可选，财税通手机号；不传则优先用环境变量 CST_USERNAME
   --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
+  --keep-browser       可选，导入完成后保留浏览器，不自动关闭
   --no-update          可选，跳过 git 拉取最新代码
   --skip-install       可选，跳过 pip 安装依赖
   --help               显示帮助
@@ -80,6 +82,10 @@ while [[ $# -gt 0 ]]; do
     --company-id)
       COMPANY_ID_ARG="${2:-}"
       shift 2
+      ;;
+    --keep-browser)
+      KEEP_BROWSER=1
+      shift
       ;;
     --no-update)
       AUTO_UPDATE=0
@@ -169,3 +175,49 @@ fi
 echo "==> 开始导入..."
 "${CMD[@]}"
 echo "==> 导入完成，报告文件: $OUTPUT"
+
+if [[ "$KEEP_BROWSER" -eq 1 ]]; then
+  echo "==> 已按要求保留浏览器，不执行自动关闭"
+  exit 0
+fi
+
+if python3 - "$OUTPUT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+if not report_path.exists():
+    print("导入报告不存在，跳过自动关闭")
+    raise SystemExit(1)
+
+report = json.loads(report_path.read_text(encoding="utf-8"))
+checks = [
+    ("step1.fail", report.get("step1", {}).get("fail", [])),
+    ("step1_department_sync.fail", report.get("step1_department_sync", {}).get("fail", [])),
+    ("step1_roles.fail", report.get("step1_roles", {}).get("fail", [])),
+    ("step2.relations_fail", report.get("step2", {}).get("relations_fail", [])),
+    ("step2.reset_fail", report.get("step2", {}).get("reset_fail", [])),
+    ("step3.fail", report.get("step3", {}).get("fail", [])),
+    ("step3.default_model_fail", report.get("step3", {}).get("default_model_fail", [])),
+    ("step3.ui_save_fail", report.get("step3", {}).get("ui_save_fail", [])),
+]
+failed = [(name, value) for name, value in checks if value]
+if failed:
+    print("导入报告仍包含失败项：")
+    for name, value in failed:
+        print(f"- {name}: {len(value)}")
+    raise SystemExit(1)
+print("导入报告校验通过，可自动关闭浏览器")
+PY
+then
+  echo "==> 导入结果校验通过，关闭财税通自动化浏览器..."
+  if bash "$REPO_DIR/run_openclaw_close_browser.sh" --browser "$BROWSER" --no-update; then
+    echo "==> 导入成功，浏览器已关闭"
+  else
+    echo "==> 导入成功，但浏览器关闭失败，请检查上面的错误信息" >&2
+    exit 1
+  fi
+else
+  echo "==> 导入报告中仍有失败项，保留浏览器供排查"
+fi
