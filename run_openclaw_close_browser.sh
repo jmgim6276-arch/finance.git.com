@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BROWSER="auto"
-AUTO_UPDATE=1
+AUTO_UPDATE=0
 DRY_RUN=0
 TIMEOUT="5"
 
@@ -16,7 +16,8 @@ usage() {
   --browser NAME       可选，auto|edge|chrome，默认 auto
   --timeout SECONDS    可选，关闭后验证秒数，默认 5
   --dry-run            可选，只检测，不实际关闭
-  --no-update          可选，跳过 git 拉取最新代码
+  --update             可选，执行前显式 git 拉取最新代码
+  --no-update          可选，兼容旧参数；当前默认就不拉取
   --help               显示帮助
 EOF
 }
@@ -33,6 +34,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --dry-run)
       DRY_RUN=1
+      shift
+      ;;
+    --update)
+      AUTO_UPDATE=1
       shift
       ;;
     --no-update)

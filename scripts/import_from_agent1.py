@@ -423,6 +423,22 @@ def clear_fee_role_relations(role_id, headers):
 
 
 def normalize_text(v):
+    """Normalize various cell values to a clean string.
+
+    Note: some Excel headers/rows may produce a pandas Series (e.g. duplicated
+    column labels). In that case, pick the first non-null item.
+    """
+    if isinstance(v, pd.Series):
+        if v.empty:
+            return ""
+        # Prefer first non-null value
+        for item in v.tolist():
+            if not pd.isna(item):
+                v = item
+                break
+        else:
+            return ""
+
     if pd.isna(v):
         return ""
     text = str(v).replace("\xa0", " ").strip()
@@ -635,7 +651,17 @@ def remember_department_in_index(dep_index, dep_id, title, parent_id):
 
 def department_titles_from_row(row, df1):
     dept_titles = []
-    for label in ["一级部门名称", "二级部门", "三级部门"]:
+    available_headers = {str(col).strip() for col in df1.columns if str(col).strip()}
+
+    # Support both historical and current sheet layouts.
+    # old: 一级部门名称 -> 二级部门 -> 三级部门
+    # new: 企业名称 -> 一级部门 -> 二级部门
+    if "一级部门名称" in available_headers or "三级部门" in available_headers:
+        labels = ["一级部门名称", "二级部门", "三级部门"]
+    else:
+        labels = ["企业名称", "一级部门", "二级部门"]
+
+    for label in labels:
         try:
             col = get_col(df1, label)
         except KeyError:
@@ -1139,6 +1165,8 @@ def get_col(df, target):
             return col
     for col in df.columns:
         c = str(col).strip()
+        if not c:
+            continue
         norm_col = _normalize_label(c)
         if norm_col == norm_target or norm_target in norm_col or norm_col in norm_target:
             return col

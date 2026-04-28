@@ -39,11 +39,17 @@ bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx
 
 这条脚本会自动做几件事：
 
-- 优先 `git pull --ff-only origin main` 拉最新代码
-- 自动安装/校验依赖
+- 默认直接使用当前本地仓库版本
+- 默认不主动 `git pull`、不主动安装依赖
 - 导入时强制带 `--auto-login`
 - 浏览器登录态过期时，自动重新登录财税通
 - 导入报告没有失败项时，自动关闭财税通自动化浏览器
+
+如果你明确要在执行前更新代码或补装依赖，再额外加：
+
+```bash
+bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" --update --install
+```
 
 如果你不想每次手动输入账号密码，可以在仓库根目录放一个 `.openclaw.env`，格式参考 `.openclaw.env.example`。
 
@@ -80,9 +86,11 @@ bash run_openclaw_login.sh \
 
 这个脚本只做三件事：
 
-- 拉最新 `main`
-- 安装/校验依赖
+- 默认直接使用当前本地仓库版本
+- 默认不主动 `git pull`、不主动安装依赖
 - 自动打开浏览器并登录财税通
+
+如果你明确要在登录前更新代码或补装依赖，再加 `--update --install`。
 
 它不会读取 Excel，也不会执行 Step1/Step2/Step3。
 
@@ -99,6 +107,8 @@ bash run_openclaw_close_browser.sh --browser auto
 - 默认识别 `~/.finance-cst/edge-cdp-profile`
 - 默认识别 `~/.finance-cst/chrome-cdp-profile`
 - 只在进程消失且本地 CDP 端口不可用后，才返回关闭成功
+
+默认也不会主动更新仓库；如果你确实需要，再显式加 `--update`。
 
 如果你只是想先确认它会关到哪个浏览器，不真正执行：
 

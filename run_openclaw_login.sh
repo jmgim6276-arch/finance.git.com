@@ -6,8 +6,8 @@ BROWSER="edge"
 USERNAME_ARG=""
 PASSWORD_ARG=""
 COMPANY_ID_ARG=""
-AUTO_UPDATE=1
-INSTALL_DEPS=1
+AUTO_UPDATE=0
+INSTALL_DEPS=0
 
 usage() {
   cat <<'EOF'
@@ -19,8 +19,10 @@ usage() {
   --username VALUE     可选，财税通手机号；不传则优先用环境变量 CST_USERNAME
   --password VALUE     可选，财税通密码；不传则优先用环境变量 CST_PASSWORD
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
-  --no-update          可选，跳过 git 拉取最新代码
-  --skip-install       可选，跳过 pip 安装依赖
+  --update             可选，执行前显式 git 拉取最新代码
+  --install            可选，执行前显式安装/校验依赖
+  --no-update          可选，兼容旧参数；当前默认就不拉取
+  --skip-install       可选，兼容旧参数；当前默认就不安装
   --help               显示帮助
 
 环境变量：
@@ -68,6 +70,14 @@ while [[ $# -gt 0 ]]; do
     --company-id)
       COMPANY_ID_ARG="${2:-}"
       shift 2
+      ;;
+    --update)
+      AUTO_UPDATE=1
+      shift
+      ;;
+    --install)
+      INSTALL_DEPS=1
+      shift
       ;;
     --no-update)
       AUTO_UPDATE=0
