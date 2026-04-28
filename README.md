@@ -39,12 +39,25 @@ bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx
 
 这条脚本会自动做几件事：
 
-- 优先 `git pull --ff-only origin main` 拉最新代码
-- 自动安装/校验依赖
+- 默认直接使用当前本地仓库版本
+- 默认不主动 `git pull`、不主动安装依赖
 - 导入时强制带 `--auto-login`
 - 浏览器登录态过期时，自动重新登录财税通
+- 导入报告没有失败项时，自动关闭财税通自动化浏览器
+
+如果你明确要在执行前更新代码或补装依赖，再额外加：
+
+```bash
+bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" --update --install
+```
 
 如果你不想每次手动输入账号密码，可以在仓库根目录放一个 `.openclaw.env`，格式参考 `.openclaw.env.example`。
+
+如果你这次想保留浏览器方便排查：
+
+```bash
+bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" --keep-browser
+```
 
 如果你更希望每次都临时发给 OpenClaw 不同账号，也可以直接这样跑：
 
@@ -53,10 +66,12 @@ bash run_openclaw_import.sh \
   --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx" \
   --username "你的手机号" \
   --password "你的密码" \
-  --company-id "8108"
+  --company-id "8108" \
+  --company-name "上海公司"
 ```
 
 这种方式不会要求你固定使用 `.openclaw.env`。更适合你有多个财税通账号轮流登录的场景。
+如果你只有集团/公司名称，没有 `company-id`，也建议至少传 `--company-name`，脚本会用它校验并切换目标企业，避免误复用上一次别的公司浏览器上下文。
 
 ## 2.2) 只登录财税通，不做导入
 
@@ -71,11 +86,35 @@ bash run_openclaw_login.sh \
 
 这个脚本只做三件事：
 
-- 拉最新 `main`
-- 安装/校验依赖
+- 默认直接使用当前本地仓库版本
+- 默认不主动 `git pull`、不主动安装依赖
 - 自动打开浏览器并登录财税通
 
+如果你明确要在登录前更新代码或补装依赖，再加 `--update --install`。
+
 它不会读取 Excel，也不会执行 Step1/Step2/Step3。
+
+## 2.3) 只关闭财税通自动化浏览器
+
+如果你只想把 `finance.git.com` 这套自动化开的 Edge/Chrome 关掉，用这个入口：
+
+```bash
+bash run_openclaw_close_browser.sh --browser auto
+```
+
+这个脚本只会处理财税通自动化浏览器实例：
+
+- 默认识别 `~/.finance-cst/edge-cdp-profile`
+- 默认识别 `~/.finance-cst/chrome-cdp-profile`
+- 只在进程消失且本地 CDP 端口不可用后，才返回关闭成功
+
+默认也不会主动更新仓库；如果你确实需要，再显式加 `--update`。
+
+如果你只是想先确认它会关到哪个浏览器，不真正执行：
+
+```bash
+bash run_openclaw_close_browser.sh --dry-run
+```
 
 ## 2.5) 新设备快速开始
 
@@ -104,7 +143,7 @@ bash run_openclaw_import.sh --xlsx "/path/to/三表联动_客户模板_xxxx.xlsx
 - 费用角色绑定优先按完整姓名匹配，并支持自动创建费用类型角色
 - 费用科目名称匹配会自动 `strip()`，降低尾部空格导致的一级科目识别失败
 - 支持在导入前自动打开 Edge/Chrome，并通过终端隐藏输入密码自动登录财税通
-- 支持登录后自动选择企业；如果是多企业账号，可传 `--company-id`
+- 支持登录后自动选择企业；如果是多企业账号，建议同时传 `--company-id` 与 `--company-name`
 - Step3 创建单据模板后，会自动打开单据模板页并执行一次页面保存，补齐浏览器侧闭环
 
 ## 4.5) 自动登录建议
