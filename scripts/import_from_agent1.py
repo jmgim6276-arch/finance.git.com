@@ -16,6 +16,31 @@ def is_ok(resp):
     return resp.get("code") == 200 or resp.get("success") is True
 
 
+def invalidate_cache_entry(cache, key):
+    if cache is not None:
+        cache.pop(key, None)
+
+
+def query_company_users(company_id, headers, cache=None, force_refresh=False):
+    cache_key = f"company_users:{company_id}"
+    if cache is not None and not force_refresh and cache_key in cache:
+        return cache[cache_key]
+    users = (
+        requests.post(
+            f"{BASE_URL}/api/member/department/queryCompany",
+            headers=headers,
+            json={"companyId": company_id},
+            timeout=15,
+        )
+        .json()
+        .get("result", {})
+        .get("users", [])
+    )
+    if cache is not None:
+        cache[cache_key] = users
+    return users
+
+
 def default_fee_payload():
     return {
         "icon": "md-plane",
@@ -131,7 +156,10 @@ def get_invoice_component(company_id, headers):
     return None
 
 
-def get_fee_template_detail(fee_id, company_id, headers):
+def get_fee_template_detail(fee_id, company_id, headers, detail_cache=None, force_refresh=False):
+    cache_key = (company_id, fee_id)
+    if detail_cache is not None and not force_refresh and cache_key in detail_cache:
+        return detail_cache[cache_key]
     resp = requests.get(
         f"{BASE_URL}/api/bill/feeTemplate/getFeeTemplateById",
         headers=headers,
@@ -139,14 +167,33 @@ def get_fee_template_detail(fee_id, company_id, headers):
         timeout=12,
     ).json()
     if is_ok(resp):
-        return resp.get("result")
+        result = resp.get("result")
+        if detail_cache is not None and result:
+            detail_cache[cache_key] = result
+        return result
     return None
 
 
-def build_fee_create_payload(name, parent_id, company_id, headers, template_from_id=None, invoice_component=None):
+def wait_for_fee_template_detail(fee_id, company_id, headers, attempts=4, delay=0.8, detail_cache=None):
+    for attempt in range(max(1, attempts)):
+        detail = get_fee_template_detail(
+            fee_id,
+            company_id,
+            headers,
+            detail_cache=detail_cache,
+            force_refresh=(attempt > 0),
+        )
+        if detail:
+            return detail
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    return None
+
+
+def build_fee_create_payload(name, parent_id, company_id, headers, template_from_id=None, invoice_component=None, detail_cache=None):
     payload = {"name": name, "parentId": parent_id, "companyId": company_id}
     if template_from_id:
-        tmpl = get_fee_template_detail(template_from_id, company_id, headers)
+        tmpl = get_fee_template_detail(template_from_id, company_id, headers, detail_cache=detail_cache)
         if tmpl:
             payload["icon"] = tmpl.get("icon") or "md-plane"
             payload["iconColor"] = tmpl.get("iconColor") or "#4c7cc3"
@@ -169,6 +216,7 @@ def get_or_create_fee_template(
     created_cache=None,
     invoice_component=None,
     template_from_id=None,
+    detail_cache=None,
 ):
     if created_cache is None:
         created_cache = {}
@@ -184,6 +232,7 @@ def get_or_create_fee_template(
         headers,
         template_from_id=template_from_id,
         invoice_component=invoice_component,
+        detail_cache=detail_cache,
     )
     create_resp = requests.post(
         f"{BASE_URL}/api/bill/feeTemplate/addFeeTemplate",
@@ -198,7 +247,7 @@ def get_or_create_fee_template(
             new_id = new_id.get("id") or new_id.get("result")
         if new_id:
             new_id = int(new_id)
-            if get_fee_template_detail(new_id, company_id, headers):
+            if wait_for_fee_template_detail(new_id, company_id, headers, detail_cache=detail_cache):
                 created_cache[cache_key] = new_id
                 return new_id
 
@@ -220,24 +269,30 @@ def get_or_create_fee_template(
             return None
 
         existing_id = walk(fee_tree_retry)
-        if existing_id and get_fee_template_detail(existing_id, company_id, headers):
+        if existing_id and wait_for_fee_template_detail(existing_id, company_id, headers, detail_cache=detail_cache):
             created_cache[cache_key] = existing_id
             return existing_id
 
     return None
 
 
-def get_role_tree(company_id, headers):
-    return requests.get(
+def get_role_tree(company_id, headers, cache=None, force_refresh=False):
+    cache_key = f"role_tree:{company_id}"
+    if cache is not None and not force_refresh and cache_key in cache:
+        return cache[cache_key]
+    tree = requests.get(
         f"{BASE_URL}/api/member/role/get/tree",
         headers=headers,
         params={"companyId": company_id},
         timeout=12,
     ).json().get("result", [])
+    if cache is not None:
+        cache[cache_key] = tree
+    return tree
 
 
-def fee_roles_map(company_id, headers):
-    tree = get_role_tree(company_id, headers)
+def fee_roles_map(company_id, headers, cache=None):
+    tree = get_role_tree(company_id, headers, cache=cache)
     fee_group_id = None
     role_map = {}
     for cat in tree:
@@ -249,8 +304,8 @@ def fee_roles_map(company_id, headers):
     return fee_group_id, role_map
 
 
-def ensure_fee_role_group(company_id, headers):
-    fee_group_id, _ = fee_roles_map(company_id, headers)
+def ensure_fee_role_group(company_id, headers, cache=None):
+    fee_group_id, _ = fee_roles_map(company_id, headers, cache=cache)
     if fee_group_id:
         return fee_group_id
 
@@ -261,13 +316,14 @@ def ensure_fee_role_group(company_id, headers):
         timeout=12,
     ).json()
     if is_ok(create_resp):
-        fee_group_id, _ = fee_roles_map(company_id, headers)
+        invalidate_cache_entry(cache, f"role_tree:{company_id}")
+        fee_group_id, _ = fee_roles_map(company_id, headers, cache=cache)
         return fee_group_id
     return None
 
 
-def ensure_fee_role(role_name, fee_role_group_id, company_id, headers):
-    _, role_map = fee_roles_map(company_id, headers)
+def ensure_fee_role(role_name, fee_role_group_id, company_id, headers, cache=None):
+    _, role_map = fee_roles_map(company_id, headers, cache=cache)
     if role_name in role_map:
         return role_map[role_name]
 
@@ -283,7 +339,8 @@ def ensure_fee_role(role_name, fee_role_group_id, company_id, headers):
         timeout=12,
     ).json()
     if is_ok(add_resp) or "存在" in str(add_resp.get("message", "")):
-        _, role_map = fee_roles_map(company_id, headers)
+        invalidate_cache_entry(cache, f"role_tree:{company_id}")
+        _, role_map = fee_roles_map(company_id, headers, cache=cache)
         return role_map.get(role_name)
     return None
 
@@ -298,6 +355,52 @@ def get_role_detail(role_id, headers):
     if is_ok(resp):
         return resp.get("result") or {}
     return None
+
+
+def extract_standard_role_relation_ids(role_detail):
+    user_ids = []
+    department_ids = []
+    if not isinstance(role_detail, dict):
+        return user_ids, department_ids
+
+    data_type = normalize_text(role_detail.get("dataType"))
+    for item in role_detail.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        if data_type == "DEPARTMENT":
+            dep_id = item.get("departmentId") or item.get("id")
+            if dep_id:
+                department_ids.append(dep_id)
+            for user in item.get("users") or []:
+                user_id = user.get("userId") or user.get("id")
+                if user_id:
+                    user_ids.append(user_id)
+        else:
+            user_id = item.get("userId") or item.get("id")
+            if user_id:
+                user_ids.append(user_id)
+
+    return unique_list(user_ids), unique_list(department_ids)
+
+
+def extract_fee_role_relations(role_detail):
+    relations = {}
+    if not isinstance(role_detail, dict):
+        return relations
+
+    for item in role_detail.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        fee_template_id = item.get("id") or item.get("feeTemplateId")
+        if not fee_template_id:
+            continue
+        user_ids = []
+        for user in item.get("users") or []:
+            user_id = user.get("userId") or user.get("id")
+            if user_id:
+                user_ids.append(user_id)
+        relations[fee_template_id] = unique_list(user_ids)
+    return relations
 
 
 def clear_fee_role_relations(role_id, headers):
@@ -320,6 +423,22 @@ def clear_fee_role_relations(role_id, headers):
 
 
 def normalize_text(v):
+    """Normalize various cell values to a clean string.
+
+    Note: some Excel headers/rows may produce a pandas Series (e.g. duplicated
+    column labels). In that case, pick the first non-null item.
+    """
+    if isinstance(v, pd.Series):
+        if v.empty:
+            return ""
+        # Prefer first non-null value
+        for item in v.tolist():
+            if not pd.isna(item):
+                v = item
+                break
+        else:
+            return ""
+
     if pd.isna(v):
         return ""
     text = str(v).replace("\xa0", " ").strip()
@@ -328,8 +447,8 @@ def normalize_text(v):
     return text
 
 
-def role_nodes_map(company_id, headers):
-    tree = get_role_tree(company_id, headers)
+def role_nodes_map(company_id, headers, cache=None):
+    tree = get_role_tree(company_id, headers, cache=cache)
     role_map = {}
 
     def walk(nodes, root_name=None, depth=0):
@@ -353,8 +472,8 @@ def role_nodes_map(company_id, headers):
     return role_map
 
 
-def standard_role_groups(company_id, headers):
-    tree = get_role_tree(company_id, headers)
+def standard_role_groups(company_id, headers, cache=None):
+    tree = get_role_tree(company_id, headers, cache=cache)
     group_map = {}
     for node in tree or []:
         group_name = normalize_text(node.get("name"))
@@ -390,12 +509,12 @@ def guess_standard_role_config(role_name, role_groups):
     return (None, None)
 
 
-def ensure_standard_role(role_name, company_id, headers):
-    existing_roles = role_nodes_map(company_id, headers)
+def ensure_standard_role(role_name, company_id, headers, cache=None):
+    existing_roles = role_nodes_map(company_id, headers, cache=cache)
     if role_name in existing_roles:
         return existing_roles[role_name]
 
-    role_groups = standard_role_groups(company_id, headers)
+    role_groups = standard_role_groups(company_id, headers, cache=cache)
     root_name, data_type = guess_standard_role_config(role_name, role_groups)
     parent = role_groups.get(root_name) if root_name else None
     if not parent:
@@ -413,7 +532,8 @@ def ensure_standard_role(role_name, company_id, headers):
         timeout=12,
     ).json()
     if is_ok(add_resp) or "存在" in str(add_resp.get("message", "")):
-        return role_nodes_map(company_id, headers).get(role_name)
+        invalidate_cache_entry(cache, f"role_tree:{company_id}")
+        return role_nodes_map(company_id, headers, cache=cache).get(role_name)
     return None
 
 
@@ -531,7 +651,17 @@ def remember_department_in_index(dep_index, dep_id, title, parent_id):
 
 def department_titles_from_row(row, df1):
     dept_titles = []
-    for label in ["一级部门名称", "二级部门", "三级部门"]:
+    available_headers = {str(col).strip() for col in df1.columns if str(col).strip()}
+
+    # Support both historical and current sheet layouts.
+    # old: 一级部门名称 -> 二级部门 -> 三级部门
+    # new: 企业名称 -> 一级部门 -> 二级部门
+    if "一级部门名称" in available_headers or "三级部门" in available_headers:
+        labels = ["一级部门名称", "二级部门", "三级部门"]
+    else:
+        labels = ["企业名称", "一级部门", "二级部门"]
+
+    for label in labels:
         try:
             col = get_col(df1, label)
         except KeyError:
@@ -629,6 +759,16 @@ def unique_list(values):
         seen.add(value)
         result.append(value)
     return result
+
+
+def merge_unique_ids(*groups):
+    merged = []
+    for group in groups:
+        for value in group or []:
+            if value in (None, ""):
+                continue
+            merged.append(value)
+    return unique_list(merged)
 
 
 def build_department_path_cache(df1, users):
@@ -853,6 +993,21 @@ def query_bill_template(template_id, company_id, headers):
     return None
 
 
+def extract_template_scope_ids(template_detail):
+    scope = (template_detail or {}).get("scope") or {}
+    return {
+        "departmentIds": merge_unique_ids(
+            [item.get("departmentId") or item.get("id") for item in scope.get("departments") or [] if isinstance(item, dict)]
+        ),
+        "roleIds": merge_unique_ids(
+            [item.get("id") for item in scope.get("roles") or [] if isinstance(item, dict)]
+        ),
+        "userIds": merge_unique_ids(
+            [item.get("userId") or item.get("id") for item in scope.get("users") or [] if isinstance(item, dict)]
+        ),
+    }
+
+
 def sanitize_template_for_update(template_payload):
     return {k: template_payload.get(k) for k in _TEMPLATE_UPDATE_ALLOWLIST if k in template_payload}
 
@@ -887,6 +1042,74 @@ def build_template_name_id_map(tree):
 
     walk(tree)
     return name_to_id
+
+
+def query_template_tree(company_id, headers, cache=None, force_refresh=False):
+    cache_key = f"template_tree:{company_id}"
+    if cache is not None and not force_refresh and cache_key in cache:
+        return cache[cache_key]
+    result = (
+        requests.get(
+            f"{BASE_URL}/api/bill/template/queryTemplateTree",
+            headers=headers,
+            params={"companyId": company_id},
+            timeout=12,
+        ).json().get("result", [])
+        or []
+    )
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def find_template_id_by_name(doc_name, company_id, headers, retries=4, delay=0.8, cache=None):
+    for attempt in range(max(1, retries)):
+        name_map = build_template_name_id_map(
+            query_template_tree(company_id, headers, cache=cache, force_refresh=(attempt > 0))
+        )
+        template_id = name_map.get(doc_name)
+        if template_id:
+            return template_id
+        if attempt + 1 < retries:
+            time.sleep(delay)
+    return None
+
+
+def verify_template_persisted(doc_name, company_id, headers, cache=None):
+    template_id = find_template_id_by_name(doc_name, company_id, headers, cache=cache)
+    if not template_id:
+        return None
+    template = query_bill_template(template_id, company_id, headers)
+    if not template:
+        return None
+    return {
+        "templateId": template_id,
+        "templateName": template.get("name") or doc_name,
+        "message": "页面保存未拿到成功提示，但后台已能读取模板",
+    }
+
+
+def ui_save_bill_template_with_retry(doc_name, company_id, headers, preferred_browser="auto", reload_page=False, attempts=3, cache=None):
+    errors = []
+    for attempt in range(max(1, attempts)):
+        try:
+            result = ui_save_bill_template(
+                doc_name,
+                preferred_browser=preferred_browser,
+                reload_page=(reload_page or attempt > 0),
+            )
+            result["attempt"] = attempt + 1
+            return "ok", result, errors
+        except Exception as exc:
+            errors.append(str(exc))
+            if attempt + 1 < attempts:
+                time.sleep(1 + attempt)
+
+    persisted = verify_template_persisted(doc_name, company_id, headers, cache=cache)
+    if persisted:
+        persisted["attempt"] = attempts
+        return "warning", persisted, errors
+    return "fail", None, errors
 
 
 def read_sheet_with_header(path: Path, sheet: str, header_key: str):
@@ -942,10 +1165,42 @@ def get_col(df, target):
             return col
     for col in df.columns:
         c = str(col).strip()
+        if not c:
+            continue
         norm_col = _normalize_label(c)
         if norm_col == norm_target or norm_target in norm_col or norm_col in norm_target:
             return col
     raise KeyError(target)
+
+
+def has_meaningful_value(value):
+    text = str(value).strip()
+    return bool(text) and text.lower() not in {"nan", "none", "null"}
+
+
+def filter_rows_by_optional_flag(df, flag_label=None, required_labels=None):
+    if flag_label:
+        try:
+            flag_col = get_col(df, flag_label)
+        except KeyError:
+            flag_col = None
+        if flag_col:
+            mask = df[flag_col].astype(str).str.strip() == "是"
+            return df[mask].copy()
+
+    required_cols = []
+    for label in required_labels or []:
+        try:
+            required_cols.append(get_col(df, label))
+        except KeyError:
+            continue
+
+    if required_cols:
+        mask = df[required_cols].apply(lambda row: any(has_meaningful_value(v) for v in row), axis=1)
+        return df[mask].copy()
+
+    mask = df.apply(lambda row: any(has_meaningful_value(v) for v in row), axis=1)
+    return df[mask].copy()
 
 
 def main():
@@ -956,6 +1211,7 @@ def main():
     parser.add_argument("--username", help="财税通登录手机号；不传则优先读取 CST_USERNAME，仍缺失时终端提示输入")
     parser.add_argument("--password", help="财税通登录密码；不传则优先读取 CST_PASSWORD，仍缺失时终端隐藏输入")
     parser.add_argument("--company-id", type=int, help="多企业账号时指定 companyId；也可用环境变量 CST_COMPANY_ID")
+    parser.add_argument("--company-name", help="期望进入的集团/公司名称；用于校验和多企业切换")
     parser.add_argument(
         "--browser",
         choices=["auto", "edge", "chrome"],
@@ -971,14 +1227,18 @@ def main():
         username=args.username,
         password=args.password,
         company_id=args.company_id,
+        company_name=args.company_name,
         prompt=args.auto_login,
     )
     print(f"✅ 检测到 {browser_name} 浏览器")
     h = {"x-token": token, "Content-Type": "application/json"}
+    api_cache = {}
+    fee_detail_cache = {}
 
     report = {
         "companyId": company_id,
         "xlsx": str(xlsx),
+        "preflight": {"has_risk": False, "missing_primary": [], "missing_people": [], "doc_mismatch_02_only": [], "doc_mismatch_03_only": []},
         "step1": {"ok": 0, "fail": []},
         "step1_department_sync": {"ok": 0, "fail": []},
         "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}, "created_roles": []},
@@ -993,12 +1253,13 @@ def main():
             "default_model_ok": [],
             "default_model_fail": [],
             "ui_save_ok": [],
+            "ui_save_warn": [],
             "ui_save_fail": [],
         },
     }
 
     # Base maps
-    users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
+    users = query_company_users(company_id, h, cache=api_cache)
     user_map = {u.get("nickName"): u.get("id") for u in users if u.get("nickName") and u.get("id")}
     deps = query_departments(company_id, h)
     dep_index = build_department_index(deps)
@@ -1013,10 +1274,10 @@ def main():
     
     # 1. 查询系统中所有员工
     print("\n1️⃣ 查询系统中现有员工...")
-    existing_users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
+    existing_users = users
     existing_user_names = {u.get("nickName"): u for u in existing_users if u.get("nickName")}
-    df1_check = read_sheet_with_header(xlsx, "01_添加员工", "是否导入")
-    df1_check = df1_check[df1_check[get_col(df1_check, "是否导入")].astype(str).str.strip() == "是"].copy()
+    df1_check = read_sheet_with_header(xlsx, "01_添加员工", "姓名")
+    df1_check = filter_rows_by_optional_flag(df1_check, "是否导入", ["姓名", "手机号"])
     existing_user_aliases = build_sheet_user_aliases(df1_check, existing_users)
     print(f"   系统中共有 {len(existing_user_names)} 名员工")
     
@@ -1045,7 +1306,7 @@ def main():
     
     # 3. 查询系统中所有单据模板
     print("\n3️⃣ 查询系统中现有单据模板...")
-    existing_templates = requests.get(f"{BASE_URL}/api/bill/template/queryTemplateTree", headers=h, params={"companyId": company_id}, timeout=12).json().get("result", []) or []
+    existing_templates = query_template_tree(company_id, h, cache=api_cache)
     existing_template_names = set()
     for g in existing_templates:
         for t in (g.get("children") or []):
@@ -1056,7 +1317,11 @@ def main():
     # 4. 读取Excel并核对
     print("\n4️⃣ 核对 02_费用科目配置 表...")
     df2_check = read_sheet_with_header(xlsx, "02_费用科目配置", "一级费用科目")
-    df2_check = df2_check[df2_check[get_col(df2_check, "是否执行")].astype(str).str.strip() == "是"].copy()
+    df2_check = filter_rows_by_optional_flag(
+        df2_check,
+        "是否执行",
+        ["一级费用科目", "二级费用科目", "三级费用科目", "归属单据名称", "单据适配人员"],
+    )
     
     # 核对一级费用科目
     missing_primary = []
@@ -1075,6 +1340,7 @@ def main():
         for name in sorted(existing_primary.keys()):
             print(f"      - {name}")
         has_error = True
+        report["preflight"]["missing_primary"] = missing_primary
     else:
         print(f"   ✅ 所有一级费用科目都存在")
     
@@ -1098,6 +1364,7 @@ def main():
         for name in sorted(existing_user_names.keys())[:15]:
             print(f"      - {name}")
         has_error = True
+        report["preflight"]["missing_people"] = missing_people
     else:
         print(f"   ✅ 所有 {len(checked_people)} 名单据适配人员都存在")
 
@@ -1108,7 +1375,7 @@ def main():
     except KeyError:
         role_col_check = None
 
-    existing_roles = role_nodes_map(company_id, h) if role_col_check else {}
+    existing_roles = role_nodes_map(company_id, h, cache=api_cache) if role_col_check else {}
     missing_roles = []
     checked_roles = set()
 
@@ -1134,7 +1401,7 @@ def main():
     # 核对 03_单据表
     print("\n6️⃣ 核对 03_单据表...")
     df3_check = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
-    df3_check = df3_check[df3_check[get_col(df3_check, "是否创建")].astype(str).str.strip() == "是"].copy()
+    df3_check = filter_rows_by_optional_flag(df3_check, "是否创建", ["单据分组（一级目录）", "单据模板名称"])
     
     # 检查单据模板名称是否与02表的归属单据名称匹配
     doc_names_from_02 = set(df2_check[get_col(df2_check, "归属单据名称")].dropna().unique())
@@ -1145,33 +1412,28 @@ def main():
         print(f"\n   ⚠️  02表中有但03表中没有的单据名称：")
         for d in mismatch:
             print(f"      - {d}")
-    
+        report["preflight"]["doc_mismatch_02_only"] = sorted(mismatch)
+
     mismatch2 = doc_names_from_03 - doc_names_from_02
     if mismatch2:
         print(f"\n   ⚠️  03表中有但02表中没有的单据名称：")
         for d in mismatch2:
             print(f"      - {d}")
+        report["preflight"]["doc_mismatch_03_only"] = sorted(mismatch2)
     
-    # 如果有错误，报告并退出
-    if False:  # 跳过检查
+    report["preflight"]["has_risk"] = has_error
+    if has_error:
         print("\n" + "="*50)
-        print("❌ 数据核对失败，请先修正Excel中的数据！")
+        print("⚠️ 数据核对发现风险，将继续导入并在报告中保留这些风险项")
         print("="*50)
-        report["step2"]["relations_fail"].append({
-            "检查": "数据核对",
-            "缺失一级科目": missing_primary if missing_primary else [],
-            "缺失人员": missing_people if missing_people else []
-        })
-        Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        return
     else:
         print("\n" + "="*50)
         print("✅ 数据核对通过！")
         print("="*50)
 
     # Step1
-    df1 = read_sheet_with_header(xlsx, "01_添加员工", "是否导入")
-    df1 = df1[df1[get_col(df1, "是否导入")].astype(str).str.strip() == "是"]
+    df1 = read_sheet_with_header(xlsx, "01_添加员工", "姓名")
+    df1 = filter_rows_by_optional_flag(df1, "是否导入", ["姓名", "手机号"])
     try:
         role_col = get_col(df1, "角色管理")
     except KeyError:
@@ -1214,17 +1476,19 @@ def main():
                     "nickName": name,
                     "mobile": mobile,
                     "userName": mobile,
+                    "departmentIds": list(department_ids),
                 }
         else:
             msg = str(r.get("message", ""))
             if "已" in msg or "存在" in msg:
                 existing_user = existing_user_by_mobile.get(mobile)
                 if existing_user and existing_user.get("id"):
+                    merged_department_ids = merge_unique_ids(existing_user.get("departmentIds"), department_ids)
                     update_payload = {
                         "id": existing_user.get("id"),
                         "nickName": name,
                         "mobile": mobile,
-                        "departmentIds": department_ids,
+                        "departmentIds": merged_department_ids,
                         "companyId": company_id,
                     }
                     update_resp = requests.post(
@@ -1234,6 +1498,7 @@ def main():
                         timeout=12,
                     ).json()
                     if is_ok(update_resp):
+                        existing_user["departmentIds"] = merged_department_ids
                         report["step1"]["ok"] += 1
                     else:
                         report["step1"]["fail"].append(
@@ -1249,10 +1514,14 @@ def main():
                 report["step1"]["fail"].append({"row": int(i + 1), "reason": msg})
 
     # Step1 完成后刷新用户列表，确保能获取到所有员工（包括刚添加的和已存在的）
-    users = requests.post(f"{BASE_URL}/api/member/department/queryCompany", headers=h, json={"companyId": company_id}, timeout=15).json().get("result", {}).get("users", [])
+    users = query_company_users(company_id, h, cache=api_cache, force_refresh=True)
     user_map = {u.get("nickName"): u.get("id") for u in users if u.get("nickName") and u.get("id")}
     user_by_mobile = {}
+    user_by_id = {}
     for u in users:
+        uid = u.get("id")
+        if uid and uid not in user_by_id:
+            user_by_id[uid] = u
         mobile = normalize_mobile(u.get("mobile") or u.get("userName") or u.get("phone"))
         if mobile and mobile not in user_by_mobile:
             user_by_mobile[mobile] = u
@@ -1293,7 +1562,9 @@ def main():
             )
             continue
 
-        sync_resp = set_user_departments_exact(user_id, department_ids, company_id, h)
+        current_user = user_by_id.get(user_id) or (user_by_mobile.get(mobile) if mobile else None) or {}
+        merged_department_ids = merge_unique_ids(current_user.get("departmentIds"), department_ids)
+        sync_resp = set_user_departments_exact(user_id, merged_department_ids, company_id, h)
         if is_ok(sync_resp):
             report["step1_department_sync"]["ok"] += 1
         else:
@@ -1309,7 +1580,7 @@ def main():
 
     if role_col:
         role_bindings = {}
-        existing_roles = role_nodes_map(company_id, h)
+        existing_roles = role_nodes_map(company_id, h, cache=api_cache)
         for i, row in df1.iterrows():
             name = normalize_text(row.get(get_col(df1, "姓名"), ""))
             if not name:
@@ -1333,9 +1604,9 @@ def main():
                     continue
                 role_info = existing_roles.get(role_name)
                 if not role_info:
-                    role_info = ensure_standard_role(role_name, company_id, h)
+                    role_info = ensure_standard_role(role_name, company_id, h, cache=api_cache)
                     if role_info:
-                        existing_roles = role_nodes_map(company_id, h)
+                        existing_roles = role_nodes_map(company_id, h, cache=api_cache)
                         if role_name not in report["step1_roles"]["created_roles"]:
                             report["step1_roles"]["created_roles"].append(role_name)
                     else:
@@ -1365,12 +1636,27 @@ def main():
 
         for role_name, binding in role_bindings.items():
             role_info = binding["role"]
+            role_detail = get_role_detail(role_info.get("id"), h)
+            if role_detail is None:
+                report["step1_roles"]["fail"].append(
+                    {
+                        "角色": role_name,
+                        "users": binding["users"],
+                        "message": "读取现有角色成员失败，为避免覆盖旧成员已跳过",
+                    }
+                )
+                continue
+            existing_user_ids, existing_department_ids = extract_standard_role_relation_ids(role_detail)
+            merged_user_ids = merge_unique_ids(existing_user_ids, binding["user_ids"])
+            merged_department_ids = None
+            if role_info.get("dataType") == "DEPARTMENT":
+                merged_department_ids = merge_unique_ids(existing_department_ids, binding["department_ids"])
             rel = add_role_relation(
                 role_info,
-                binding["user_ids"],
+                merged_user_ids,
                 company_id,
                 h,
-                department_ids=binding["department_ids"] if role_info.get("dataType") == "DEPARTMENT" else None,
+                department_ids=merged_department_ids,
             )
             if is_ok(rel) or "存在" in str(rel.get("message", "")):
                 report["step1_roles"]["ok"] += len(binding["user_ids"])
@@ -1399,7 +1685,11 @@ def main():
 
     # Step2
     df2 = read_sheet_with_header(xlsx, "02_费用科目配置", "一级费用科目")
-    df2 = df2[df2[get_col(df2, "是否执行")].astype(str).str.strip() == "是"].copy()
+    df2 = filter_rows_by_optional_flag(
+        df2,
+        "是否执行",
+        ["一级费用科目", "二级费用科目", "三级费用科目", "归属单据名称", "单据适配人员"],
+    )
     for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目")]:
         df2[c] = df2[c].ffill()
     # 处理四级费用科目（如果存在）
@@ -1419,8 +1709,8 @@ def main():
     #    - 把该单据对应的所有末级费用科目绑定到这个角色
     #    - 把该单据适配的所有人员绑定到这个角色
 
-    fee_role_group_id = ensure_fee_role_group(company_id, h)
-    _, fee_roles = fee_roles_map(company_id, h)
+    fee_role_group_id = ensure_fee_role_group(company_id, h, cache=api_cache)
+    _, fee_roles = fee_roles_map(company_id, h, cache=api_cache)
     has_people = {}
     doc_people_map = {}
     row_role_bindings = []
@@ -1476,6 +1766,7 @@ def main():
                 created_cache=created_level2,
                 invoice_component=invoice_component,
                 template_from_id=pid,
+                detail_cache=fee_detail_cache,
             )
             if not sid:
                 report["step2"]["relations_fail"].append({"doc": doc, "二级费用科目": s, "message": f"创建二级费用科目 '{s}' 失败或详情不可读"})
@@ -1494,7 +1785,16 @@ def main():
             if t3.isdigit() or len(t3) < 2:
                 report["step2"]["relations_fail"].append({"doc": doc, "三级费用科目": t3, "message": f"三级费用科目名称 '{t3}' 无效（不能是纯数字或单个字符）"})
                 continue
-            t3_id = get_or_create_fee_template(t3, sid, company_id, h, fee_cache, invoice_component=invoice_component, template_from_id=sid)
+            t3_id = get_or_create_fee_template(
+                t3,
+                sid,
+                company_id,
+                h,
+                fee_cache,
+                invoice_component=invoice_component,
+                template_from_id=sid,
+                detail_cache=fee_detail_cache,
+            )
             if t3_id:
                 leaf_id = t3_id
             else:
@@ -1504,7 +1804,16 @@ def main():
         # 四级存在时，在三级下查找或创建（如果三级不存在，则直接在二级下创建四级）
         if t4:
             parent_for_t4 = leaf_id if t3 else sid
-            t4_id = get_or_create_fee_template(t4, parent_for_t4, company_id, h, fee_cache, invoice_component=invoice_component, template_from_id=parent_for_t4)
+            t4_id = get_or_create_fee_template(
+                t4,
+                parent_for_t4,
+                company_id,
+                h,
+                fee_cache,
+                invoice_component=invoice_component,
+                template_from_id=parent_for_t4,
+                detail_cache=fee_detail_cache,
+            )
             if t4_id:
                 leaf_id = t4_id
             else:
@@ -1538,14 +1847,14 @@ def main():
     for doc in {binding["doc"] for binding in row_role_bindings}:
         rid = fee_roles.get(doc)
         if not rid and fee_role_group_id:
-            rid = ensure_fee_role(doc, fee_role_group_id, company_id, h)
-            _, fee_roles = fee_roles_map(company_id, h)
+            rid = ensure_fee_role(doc, fee_role_group_id, company_id, h, cache=api_cache)
+            _, fee_roles = fee_roles_map(company_id, h, cache=api_cache)
         if not rid:
             report["step2"]["relations_fail"].append({"doc": doc, "角色名称": doc, "message": "按单据模板名称创建费用角色失败"})
             continue
         doc_role_ids[doc] = rid
 
-    reset_done_docs = set()
+    fee_role_state_cache = {}
     for binding in row_role_bindings:
         doc = binding["doc"]
         leaf_id = binding["leaf_id"]
@@ -1553,15 +1862,6 @@ def main():
         rid = doc_role_ids.get(doc)
         if not rid:
             continue
-
-        if doc not in reset_done_docs:
-            ok, msg = clear_fee_role_relations(rid, h)
-            if ok:
-                reset_done_docs.add(doc)
-                report["step2"]["reset_docs"].append(doc)
-            else:
-                report["step2"]["reset_fail"].append({"doc": doc, "roleId": rid, "message": msg})
-                continue
 
         user_ids = []
         for person_name in people:
@@ -1576,11 +1876,22 @@ def main():
             report["step2"]["relations_fail"].append({"doc": doc, "费用科目ID": leaf_id, "message": "本行单据适配人员为空或都未在系统中找到，跳过该费用科目绑定"})
             continue
 
+        if rid not in fee_role_state_cache:
+            role_detail = get_role_detail(rid, h)
+            if role_detail is None:
+                report["step2"]["relations_fail"].append(
+                    {"doc": doc, "roleId": rid, "message": "读取现有费用角色关系失败，为避免覆盖旧配置已跳过"}
+                )
+                continue
+            fee_role_state_cache[rid] = extract_fee_role_relations(role_detail)
+        existing_user_ids = fee_role_state_cache[rid].get(leaf_id, [])
+        merged_user_ids = merge_unique_ids(existing_user_ids, user_ids)
+
         update_payload = {
             "roleId": rid,
             "companyId": company_id,
             "feeTemplateIds": [leaf_id],
-            "userIds": sorted(user_ids),
+            "userIds": sorted(merged_user_ids),
         }
         rel = requests.post(
             f"{BASE_URL}/api/member/role/add/relation",
@@ -1590,6 +1901,7 @@ def main():
         ).json()
 
         if is_ok(rel):
+            fee_role_state_cache[rid][leaf_id] = sorted(merged_user_ids)
             report["step2"]["relations_ok"] += 1
             report["step2"]["role_by_doc"][doc] = [rid]
             report["step2"]["bindings_detail"].append(
@@ -1597,7 +1909,7 @@ def main():
                     "doc": doc,
                     "feeTemplateIds": [leaf_id],
                     "people": people,
-                    "userIds": sorted(user_ids),
+                    "userIds": sorted(merged_user_ids),
                     "roleId": rid,
                 }
             )
@@ -1642,7 +1954,7 @@ def main():
 
     # Step3
     roles_vis = {}
-    tree_all = requests.get(f"{BASE_URL}/api/member/role/get/tree", headers=h, params={"companyId": company_id}, timeout=12).json().get("result", [])
+    tree_all = get_role_tree(company_id, h, cache=api_cache)
     for cat in tree_all:
         if cat.get("name") == "费用角色组":
             continue
@@ -1650,17 +1962,12 @@ def main():
             if rr.get("name") and rr.get("id"):
                 roles_vis[rr["name"]] = rr["id"]
 
-    groups = requests.get(
-        f"{BASE_URL}/api/bill/template/queryTemplateTree",
-        headers=h,
-        params={"companyId": company_id},
-        timeout=12,
-    ).json().get("result", []) or []
+    groups = existing_templates
     group_map = {g.get("name") or g.get("title"): g.get("id") for g in groups if (g.get("name") or g.get("title")) and g.get("id")}
     template_name_map = build_template_name_id_map(groups)
 
     df3 = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
-    df3 = df3[df3[get_col(df3, "是否创建")].astype(str).str.strip() == "是"].copy()
+    df3 = filter_rows_by_optional_flag(df3, "是否创建", ["单据分组（一级目录）", "单据模板名称"])
     df3[get_col(df3, "单据分组（一级目录）")] = df3[get_col(df3, "单据分组（一级目录）")].ffill()
 
     type_map = {"报销单": "EXPENSE", "借款单": "LOAN", "批量付款单": "PAYMENT", "申请单": "REQUISITION"}
@@ -1675,11 +1982,22 @@ def main():
         vis_obj = str(row.get(get_col(df3, "可见范围对象"), "")).strip()
 
         if group_name not in group_map:
-            requests.post(f"{BASE_URL}/api/bill/template/createTemplateGroup", headers=h, json={"name": group_name, "companyId": company_id}, timeout=12)
-            time.sleep(0.4)
-            groups = requests.get(f"{BASE_URL}/api/bill/template/queryTemplateTree", headers=h, params={"companyId": company_id}, timeout=12).json().get("result", []) or []
-            group_map = {g.get("name") or g.get("title"): g.get("id") for g in groups if (g.get("name") or g.get("title")) and g.get("id")}
-            template_name_map = build_template_name_id_map(groups)
+            create_group_resp = requests.post(
+                f"{BASE_URL}/api/bill/template/createTemplateGroup",
+                headers=h,
+                json={"name": group_name, "companyId": company_id},
+                timeout=12,
+            ).json()
+            group_result = create_group_resp.get("result")
+            group_id = group_result.get("id") if isinstance(group_result, dict) else group_result
+            invalidate_cache_entry(api_cache, f"template_tree:{company_id}")
+            if group_id:
+                group_map[group_name] = group_id
+            else:
+                time.sleep(0.4)
+                groups = query_template_tree(company_id, h, cache=api_cache, force_refresh=True)
+                group_map = {g.get("name") or g.get("title"): g.get("id") for g in groups if (g.get("name") or g.get("title")) and g.get("id")}
+                template_name_map = build_template_name_id_map(groups)
 
         targets = split_values(vis_obj)
         role_ids = [roles_vis[t] for t in targets if vis_type == "角色" and t in roles_vis]
@@ -1770,11 +2088,12 @@ def main():
                 report["step3"]["fail"].append({"doc": doc_name, "message": "模板已存在但读取详情失败，无法更新"})
                 continue
 
+            existing_scope_ids = extract_template_scope_ids(existing)
+            merged_department_ids = merge_unique_ids(existing_scope_ids.get("departmentIds"), dep_ids if has_visibility else [])
+            merged_role_ids = merge_unique_ids(existing_scope_ids.get("roleIds"), role_ids if has_visibility else [])
+            merged_user_ids = merge_unique_ids(existing_scope_ids.get("userIds"), user_ids if has_visibility else [])
+
             update_fields = dict(payload)
-            # Only touch fee restriction when we have a valid fee role result.
-            if not (has_people.get(doc_name, False) and fee_role_ids):
-                for k in ["feeRoleIds", "feeScopeType", "feeScopeFlag", "feeIds", "feeList"]:
-                    update_fields.pop(k, None)
             # Avoid wiping existing field settings if our defaults are empty for any reason.
             if not update_fields.get("componentJson") and existing.get("componentJson"):
                 update_fields.pop("componentJson", None)
@@ -1784,6 +2103,15 @@ def main():
                 merged[k] = v
             merged["id"] = existing_template_id
             merged["companyId"] = company_id
+            merged["departmentIds"] = merged_department_ids
+            merged["roleIds"] = merged_role_ids
+            merged["userIds"] = merged_user_ids
+            merged["userScopeFlag"] = bool(merged_department_ids or merged_role_ids or merged_user_ids)
+            if has_people.get(doc_name, False) and fee_role_ids:
+                merged["feeRoleIds"] = merge_unique_ids(existing.get("feeRoleIds"), fee_role_ids)
+                merged["feeScopeType"] = "FEE_ROLE"
+                merged["feeIds"] = []
+                merged["feeScopeFlag"] = True
 
             ur = update_bill_template(merged, h)
             if is_ok(ur):
@@ -1796,6 +2124,7 @@ def main():
         if cr.get("code") == 200 and cr.get("success"):
             report["step3"]["ok"] += 1
             created_docs.append(doc_name)
+            invalidate_cache_entry(api_cache, f"template_tree:{company_id}")
             # Best-effort refresh template map so a later row can update it.
             if cr.get("result"):
                 template_name_map.setdefault(doc_name, cr.get("result"))
@@ -1805,23 +2134,45 @@ def main():
     if created_docs:
         print("\n7️⃣ 页面保存闭环...")
         for idx, doc_name in enumerate(created_docs):
-            try:
-                save_result = ui_save_bill_template(
-                    doc_name,
-                    preferred_browser=args.browser,
-                    reload_page=(idx == 0),
-                )
+            save_status, save_result, save_errors = ui_save_bill_template_with_retry(
+                doc_name,
+                company_id,
+                h,
+                preferred_browser=args.browser,
+                reload_page=(idx == 0),
+                attempts=3,
+                cache=api_cache,
+            )
+            if save_status == "ok":
                 report["step3"]["ui_save_ok"].append(
                     {
                         "doc": doc_name,
                         "message": save_result.get("message"),
                         "templateId": save_result.get("templateId"),
+                        "attempt": save_result.get("attempt"),
                     }
                 )
                 print(f"   ✅ 已页面保存：{doc_name}")
-            except Exception as exc:
-                report["step3"]["ui_save_fail"].append({"doc": doc_name, "message": str(exc)})
-                print(f"   ❌ 页面保存失败：{doc_name} -> {exc}")
+                continue
+            if save_status == "warning":
+                report["step3"]["ui_save_warn"].append(
+                    {
+                        "doc": doc_name,
+                        "message": save_result.get("message"),
+                        "templateId": save_result.get("templateId"),
+                        "errors": save_errors,
+                    }
+                )
+                print(f"   ⚠️ 页面保存告警：{doc_name} -> {save_result.get('message')}")
+                continue
+
+            report["step3"]["ui_save_fail"].append(
+                {
+                    "doc": doc_name,
+                    "message": "；".join(save_errors) if save_errors else "页面保存失败",
+                }
+            )
+            print(f"   ❌ 页面保存失败：{doc_name} -> {'；'.join(save_errors) if save_errors else '未知错误'}")
 
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print("✅ 导入完成")
