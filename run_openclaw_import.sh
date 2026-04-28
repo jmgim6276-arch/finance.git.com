@@ -9,8 +9,8 @@ USERNAME_ARG=""
 PASSWORD_ARG=""
 COMPANY_ID_ARG=""
 COMPANY_NAME_ARG=""
-AUTO_UPDATE=1
-INSTALL_DEPS=1
+AUTO_UPDATE=0
+INSTALL_DEPS=0
 KEEP_BROWSER=0
 
 usage() {
@@ -27,8 +27,10 @@ usage() {
   --company-id VALUE   可选，多企业账号时指定 companyId；不传则优先用 CST_COMPANY_ID
   --company-name VALUE 可选，期望进入的集团/公司名称；用于校验和多企业切换
   --keep-browser       可选，导入完成后保留浏览器，不自动关闭
-  --no-update          可选，跳过 git 拉取最新代码
-  --skip-install       可选，跳过 pip 安装依赖
+  --update             可选，执行前显式 git 拉取最新代码
+  --install            可选，执行前显式安装/校验依赖
+  --no-update          可选，兼容旧参数；当前默认就不拉取
+  --skip-install       可选，兼容旧参数；当前默认就不安装
   --help               显示帮助
 
 环境变量：
@@ -91,6 +93,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --keep-browser)
       KEEP_BROWSER=1
+      shift
+      ;;
+    --update)
+      AUTO_UPDATE=1
+      shift
+      ;;
+    --install)
+      INSTALL_DEPS=1
       shift
       ;;
     --no-update)
