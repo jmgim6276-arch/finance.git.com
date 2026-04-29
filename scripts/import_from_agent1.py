@@ -656,7 +656,14 @@ def department_titles_from_row(row, df1):
     # Support both historical and current sheet layouts.
     # old: 一级部门名称 -> 二级部门 -> 三级部门
     # new: 企业名称 -> 一级部门 -> 二级部门
-    if "一级部门名称" in available_headers or "三级部门" in available_headers:
+    #
+    # Some new workbooks were manually edited and may still carry a duplicated
+    # "三级部门" header while the actual semantic shift has already happened.
+    # In that case, prefer the new layout as long as "企业名称" is present and
+    # the old "一级部门名称" header is absent.
+    if "企业名称" in available_headers and "一级部门名称" not in available_headers:
+        labels = ["企业名称", "一级部门", "二级部门", "三级部门"]
+    elif "一级部门名称" in available_headers or "三级部门" in available_headers:
         labels = ["一级部门名称", "二级部门", "三级部门"]
     else:
         labels = ["企业名称", "一级部门", "二级部门"]
