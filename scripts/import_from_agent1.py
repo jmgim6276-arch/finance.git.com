@@ -447,8 +447,8 @@ def normalize_text(v):
     return text
 
 
-def role_nodes_map(company_id, headers, cache=None):
-    tree = get_role_tree(company_id, headers, cache=cache)
+def role_nodes_map(company_id, headers, cache=None, force_refresh=False):
+    tree = get_role_tree(company_id, headers, cache=cache, force_refresh=force_refresh)
     role_map = {}
 
     def walk(nodes, root_name=None, depth=0):
@@ -472,8 +472,8 @@ def role_nodes_map(company_id, headers, cache=None):
     return role_map
 
 
-def standard_role_groups(company_id, headers, cache=None):
-    tree = get_role_tree(company_id, headers, cache=cache)
+def standard_role_groups(company_id, headers, cache=None, force_refresh=False):
+    tree = get_role_tree(company_id, headers, cache=cache, force_refresh=force_refresh)
     group_map = {}
     for node in tree or []:
         group_name = normalize_text(node.get("name"))
@@ -509,14 +509,55 @@ def guess_standard_role_config(role_name, role_groups):
     return (None, None)
 
 
-def ensure_standard_role(role_name, company_id, headers, cache=None):
+def normalize_role_data_type(value):
+    text = normalize_text(value).replace(" ", "").upper()
+    mapping = {
+        "COMPANY": "COMPANY",
+        "普通角色": "COMPANY",
+        "公司角色": "COMPANY",
+        "普通": "COMPANY",
+        "公司": "COMPANY",
+        "DEPARTMENT": "DEPARTMENT",
+        "部门角色": "DEPARTMENT",
+        "部门": "DEPARTMENT",
+    }
+    return mapping.get(text)
+
+
+def role_matches_data_type(role_info, desired_data_type):
+    if not desired_data_type:
+        return True
+    return normalize_role_data_type((role_info or {}).get("dataType")) == desired_data_type
+
+
+def choose_standard_role_parent(role_name, role_groups, desired_data_type=None):
+    root_name, guessed_data_type = guess_standard_role_config(role_name, role_groups)
+    desired_data_type = desired_data_type or guessed_data_type or "COMPANY"
+
+    if root_name and role_groups.get(root_name):
+        return role_groups[root_name], desired_data_type
+    if role_groups.get("职务"):
+        return role_groups["职务"], desired_data_type
+
+    for root_name, root_info in role_groups.items():
+        if root_name == "费用角色组":
+            continue
+        if desired_data_type and normalize_role_data_type(root_info.get("dataType")) == desired_data_type:
+            return root_info, desired_data_type
+
+    for root_name, root_info in role_groups.items():
+        if root_name != "费用角色组":
+            return root_info, desired_data_type
+    return None, desired_data_type
+
+
+def ensure_standard_role(role_name, company_id, headers, cache=None, data_type=None):
     existing_roles = role_nodes_map(company_id, headers, cache=cache)
     if role_name in existing_roles:
         return existing_roles[role_name]
 
     role_groups = standard_role_groups(company_id, headers, cache=cache)
-    root_name, data_type = guess_standard_role_config(role_name, role_groups)
-    parent = role_groups.get(root_name) if root_name else None
+    parent, resolved_data_type = choose_standard_role_parent(role_name, role_groups, desired_data_type=data_type)
     if not parent:
         return None
 
@@ -527,7 +568,7 @@ def ensure_standard_role(role_name, company_id, headers, cache=None):
             "name": role_name,
             "companyId": company_id,
             "parentId": parent.get("id"),
-            "dataType": data_type or "COMPANY",
+            "dataType": resolved_data_type or "COMPANY",
         },
         timeout=12,
     ).json()
@@ -1211,6 +1252,13 @@ def get_col(df, target):
     raise KeyError(target)
 
 
+def get_optional_col(df, target):
+    try:
+        return get_col(df, target)
+    except KeyError:
+        return None
+
+
 def has_meaningful_value(value):
     text = str(value).strip()
     return bool(text) and text.lower() not in {"nan", "none", "null"}
@@ -1239,6 +1287,387 @@ def filter_rows_by_optional_flag(df, flag_label=None, required_labels=None):
 
     mask = df.apply(lambda row: any(has_meaningful_value(v) for v in row), axis=1)
     return df[mask].copy()
+
+
+def collect_row_role_entries(row, df1):
+    role_entries = {}
+    explicit_role_col = get_optional_col(df1, "角色名称")
+    explicit_type_col = get_optional_col(df1, "角色类型")
+    legacy_role_col = get_optional_col(df1, "角色管理")
+
+    explicit_data_type = normalize_role_data_type(row.get(explicit_type_col, "")) if explicit_type_col else None
+    if explicit_role_col:
+        for role_name in split_values(row.get(explicit_role_col, "")):
+            role_name = normalize_text(role_name)
+            if role_name:
+                role_entries[role_name] = {
+                    "name": role_name,
+                    "dataType": explicit_data_type,
+                    "source": "角色名称",
+                }
+
+    if legacy_role_col:
+        for role_name in split_values(row.get(legacy_role_col, "")):
+            role_name = normalize_text(role_name)
+            if role_name and role_name not in role_entries:
+                role_entries[role_name] = {
+                    "name": role_name,
+                    "dataType": None,
+                    "source": "角色管理",
+                }
+
+    return list(role_entries.values())
+
+
+def normalize_assignment_display(value):
+    return "，".join(split_values(value))
+
+
+def query_workflows(company_id, headers):
+    resp = requests.get(
+        f"{BASE_URL}/api/bpm/workflow/queryWorkFlow",
+        headers=headers,
+        params={"companyId": company_id, "size": 200},
+        timeout=15,
+    ).json()
+    if is_ok(resp):
+        return resp.get("result", []) or []
+    return []
+
+
+def save_workflow(workflow_id, workflow_name, workflow_json, company_id, headers):
+    payload = {
+        "id": workflow_id,
+        "tpName": workflow_name,
+        "workflowJson": workflow_json,
+        "companyId": company_id,
+    }
+    return requests.post(
+        f"{BASE_URL}/api/bpm/workflow/addWorkFlow",
+        headers=headers,
+        json=payload,
+        timeout=15,
+    ).json()
+
+
+def query_permission_tree(headers):
+    resp = requests.get(
+        f"{BASE_URL}/api/member/permission/tree",
+        headers=headers,
+        timeout=15,
+    ).json()
+    if is_ok(resp):
+        return resp.get("result", []) or []
+    return []
+
+
+def update_permission_targets(permission_group_id, role_ids, user_ids, headers):
+    return requests.post(
+        f"{BASE_URL}/api/member/permission/update",
+        headers=headers,
+        json={
+            "permissionGroupId": permission_group_id,
+            "roleIds": unique_list(role_ids),
+            "userIds": unique_list(user_ids),
+        },
+        timeout=15,
+    ).json()
+
+
+def flatten_permission_rows(nodes):
+    rows = []
+
+    def walk(items):
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") and normalize_text(item.get("name")):
+                rows.append(item)
+            walk(item.get("children") or [])
+
+    walk(nodes)
+    return rows
+
+
+def extract_permission_actor_ids(permission_row):
+    role_ids = merge_unique_ids(
+        [item.get("id") or item.get("roleId") for item in permission_row.get("roles") or [] if isinstance(item, dict)]
+    )
+    user_ids = merge_unique_ids(
+        [item.get("userId") or item.get("id") for item in permission_row.get("users") or [] if isinstance(item, dict)]
+    )
+    return role_ids, user_ids
+
+
+def get_standard_role_member_ids(role_info, headers, role_detail_cache=None):
+    role_id = (role_info or {}).get("id")
+    if not role_id:
+        return None, None
+    if role_detail_cache is not None and role_id in role_detail_cache:
+        return role_detail_cache[role_id]
+
+    role_detail = get_role_detail(role_id, headers)
+    if role_detail is None:
+        return None, None
+
+    result = extract_standard_role_relation_ids(role_detail)
+    if role_detail_cache is not None:
+        role_detail_cache[role_id] = result
+    return result
+
+
+def resolve_workflow_targets(raw_value, user_map, role_map, headers, role_detail_cache=None):
+    tokens = split_values(raw_value)
+    direct_user_ids = []
+    company_roles = []
+    department_roles = []
+    unknown_tokens = []
+
+    for token in tokens:
+        role_info = role_map.get(token)
+        if role_info and normalize_role_data_type(role_info.get("dataType")) == "DEPARTMENT":
+            department_roles.append(role_info)
+            continue
+        if role_info and normalize_role_data_type(role_info.get("dataType")) == "COMPANY":
+            company_roles.append(role_info)
+            continue
+        if token in user_map:
+            direct_user_ids.append(user_map[token])
+            continue
+        unknown_tokens.append(token)
+
+    expanded_user_ids = list(direct_user_ids)
+    empty_company_roles = []
+    role_member_errors = []
+    for role_info in company_roles:
+        member_user_ids, _ = get_standard_role_member_ids(role_info, headers, role_detail_cache=role_detail_cache)
+        if member_user_ids is None:
+            role_member_errors.append(f"读取普通角色 {role_info.get('name')} 成员失败")
+            continue
+        if not member_user_ids:
+            empty_company_roles.append(role_info.get("name"))
+            continue
+        expanded_user_ids = merge_unique_ids(expanded_user_ids, member_user_ids)
+
+    return {
+        "tokens": tokens,
+        "displayName": "，".join(tokens),
+        "userIds": unique_list(expanded_user_ids),
+        "departmentRole": department_roles[0] if department_roles else None,
+        "departmentRoleNames": [normalize_text(role.get("name")) for role in department_roles],
+        "extraDepartmentRoleNames": [normalize_text(role.get("name")) for role in department_roles[1:]],
+        "companyRoleNames": [normalize_text(role.get("name")) for role in company_roles],
+        "unknownTokens": unknown_tokens,
+        "emptyCompanyRoles": empty_company_roles,
+        "roleMemberErrors": role_member_errors,
+    }
+
+
+def resolve_permission_targets(raw_value, user_map, role_map):
+    tokens = split_values(raw_value)
+    role_ids = []
+    user_ids = []
+    role_names = []
+    user_names = []
+    unknown_tokens = []
+
+    for token in tokens:
+        role_info = role_map.get(token)
+        if role_info and role_info.get("id"):
+            role_ids.append(role_info.get("id"))
+            role_names.append(role_info.get("name") or token)
+            continue
+        user_id = user_map.get(token)
+        if user_id:
+            user_ids.append(user_id)
+            user_names.append(token)
+            continue
+        unknown_tokens.append(token)
+
+    return {
+        "tokens": tokens,
+        "roleIds": unique_list(role_ids),
+        "userIds": unique_list(user_ids),
+        "roleNames": unique_list(role_names),
+        "userNames": unique_list(user_names),
+        "unknownTokens": unknown_tokens,
+    }
+
+
+def workflow_role_selection():
+    return {
+        "ROLE_TYPE": "",
+        "ROLE_ID": "",
+        "TYPE": "ROLE",
+        "isSelect": False,
+    }
+
+
+def workflow_designation_selection():
+    return {
+        "STAFFIDS": [],
+        "TYPE": "DESIGNATION",
+        "isSelect": False,
+    }
+
+
+def workflow_carbon_copy_block():
+    return [
+        {
+            "SELECTIONS": [workflow_role_selection(), workflow_designation_selection()],
+            "SENDTIME": "REJECT",
+        }
+    ]
+
+
+def workflow_start_node():
+    return {
+        "TYPE": "start",
+        "CARBON_COPY": workflow_carbon_copy_block(),
+        "OTHER_CONFIG": {"allowSubmitterRetract": True},
+        "NAME": "开始",
+    }
+
+
+def workflow_approval_node(name):
+    return {
+        "COUNTERSIGN": {
+            "POLICY": "ANY",
+            "SELECTIONS": [
+                {
+                    "ROLE_TYPE": "",
+                    "ROLE_ID": "",
+                    "TYPE": "ROLE",
+                    "isSelect": True,
+                },
+                {
+                    "STAFFIDS": [],
+                    "TYPE": "DESIGNATION",
+                    "isSelect": False,
+                },
+            ],
+        },
+        "CONDITION": {
+            "OPERATOR": "NULL",
+            "SOURCE": "",
+            "ID": "",
+            "VALUE": 0,
+            "TYPE": "",
+        },
+        "TYPE": "simple",
+        "CARBON_COPY": workflow_carbon_copy_block(),
+        "OTHER_CONFIG": {
+            "allowApproverModify": False,
+            "autoAgreeWhenApproverRepeated": True,
+            "notActiveNodeHide": True,
+            "autoAgreeWhenApproverSameAsSubmitter": True,
+            "supportTransferApproval": False,
+            "transferApproval": {
+                "enableTransfer": False,
+                "enableBeforeSign": False,
+                "enableAfterSign": False,
+            },
+        },
+        "NAME": name,
+    }
+
+
+def workflow_end_node():
+    return {
+        "COUNTERSIGN": {
+            "POLICY": "ANY",
+            "SELECTIONS": [
+                {
+                    "ROLE_TYPE": "",
+                    "ROLE_ID": "",
+                    "TYPE": "ROLE",
+                    "isSelect": True,
+                },
+                {
+                    "STAFFIDS": [],
+                    "TYPE": "DESIGNATION",
+                    "isSelect": False,
+                },
+            ],
+        },
+        "TYPE": "cashier",
+        "NAME": "出纳",
+        "CARBON_COPY": [
+            {
+                "SENDTIME": "REJECT",
+                "SELECTIONS": [workflow_role_selection(), workflow_designation_selection()],
+            }
+        ],
+        "CONDITION": {
+            "OPERATOR": "NEQ",
+            "SOURCE": "expensesType",
+            "VALUE": "REQUISITION",
+            "TYPE": "STRING",
+        },
+        "OTHER_CONFIG": {"cashNodeAutoComplete": False},
+    }
+
+
+def build_workflow_staff_refs(user_ids, user_by_id):
+    result = []
+    for user_id in unique_list(user_ids):
+        user = user_by_id.get(user_id) or {}
+        result.append({"ID": user_id, "NAME": normalize_text(user.get("nickName")) or str(user_id)})
+    return result
+
+
+def apply_workflow_target_to_selections(selections, user_ids, role_info, user_by_id):
+    for selection in selections:
+        if selection.get("TYPE") == "ROLE":
+            if role_info:
+                selection["ROLE_ID"] = role_info.get("id") or ""
+                selection["ROLE_TYPE"] = normalize_role_data_type(role_info.get("dataType")) or ""
+                selection["isSelect"] = True
+            else:
+                selection["ROLE_ID"] = ""
+                selection["ROLE_TYPE"] = ""
+                selection["isSelect"] = False
+        elif selection.get("TYPE") == "DESIGNATION":
+            staff_refs = build_workflow_staff_refs(user_ids, user_by_id)
+            selection["STAFFIDS"] = staff_refs
+            selection["isSelect"] = bool(staff_refs)
+
+
+def build_workflow_json(workflow_name, approval_specs, copy_spec, user_by_id):
+    nodes = [workflow_start_node()]
+    for spec in approval_specs:
+        node = workflow_approval_node(spec["displayName"])
+        apply_workflow_target_to_selections(
+            node["COUNTERSIGN"]["SELECTIONS"],
+            spec.get("userIds") or [],
+            spec.get("departmentRole"),
+            user_by_id,
+        )
+        nodes.append(node)
+
+    if copy_spec and len(nodes) > 1:
+        last_node = nodes[-1]
+        if last_node.get("TYPE") == "simple":
+            last_node["CARBON_COPY"][0]["SENDTIME"] = "AGREE"
+            apply_workflow_target_to_selections(
+                last_node["CARBON_COPY"][0]["SELECTIONS"],
+                copy_spec.get("userIds") or [],
+                copy_spec.get("departmentRole"),
+                user_by_id,
+            )
+
+    nodes.append(workflow_end_node())
+    return {
+        "NAME": workflow_name,
+        "BASIC": {"billRejectMode": "0"},
+        "NODES": nodes,
+    }
+
+
+def normalize_result_id(value):
+    if isinstance(value, dict):
+        return value.get("id") or value.get("result")
+    return value
 
 
 def main():
@@ -1276,12 +1705,20 @@ def main():
     report = {
         "companyId": company_id,
         "xlsx": str(xlsx),
-        "preflight": {"has_risk": False, "missing_primary": [], "missing_people": [], "doc_mismatch_02_only": [], "doc_mismatch_03_only": []},
+        "preflight": {
+            "has_risk": False,
+            "missing_primary": [],
+            "missing_people": [],
+            "doc_mismatch_02_only": [],
+            "doc_mismatch_03_only": [],
+            "workflow_doc_mismatch_only": [],
+            "workflow_doc_missing": [],
+        },
         "step1": {"ok": 0, "fail": []},
         "step1_department_sync": {"ok": 0, "fail": []},
         "step1_roles": {"ok": 0, "fail": [], "role_by_name": {}, "created_roles": []},
         "step2": {"relations_ok": 0, "relations_fail": [], "role_by_doc": {}, "leaf_by_doc": {}, "bindings_detail": [], "reset_docs": [], "reset_fail": []},
-        "step25": {},
+        "step25": {"count": 0, "workflowId": None, "workflowName": None, "workflowByDoc": {}, "created": [], "updated": [], "fail": []},
         "step3": {
             "ok": 0,
             "fail": [],
@@ -1294,6 +1731,7 @@ def main():
             "ui_save_warn": [],
             "ui_save_fail": [],
         },
+        "step4": {"ok": 0, "fail": [], "updated_permissions": []},
     }
 
     # Base maps
@@ -1409,24 +1847,36 @@ def main():
 
     # 核对第一张表里的角色管理
     print("\n5️⃣ 补充核对角色管理列...")
-    try:
-        role_col_check = get_col(df1_check, "角色管理")
-    except KeyError:
-        role_col_check = None
-
-    existing_roles = role_nodes_map(company_id, h, cache=api_cache) if role_col_check else {}
+    role_col_check = get_optional_col(df1_check, "角色管理")
+    explicit_role_col_check = get_optional_col(df1_check, "角色名称")
+    existing_roles = role_nodes_map(company_id, h, cache=api_cache) if (role_col_check or explicit_role_col_check) else {}
     missing_roles = []
     checked_roles = set()
 
-    if role_col_check:
+    if role_col_check or explicit_role_col_check:
         for _, row in df1_check.iterrows():
-            for role_name in split_values(row.get(role_col_check, "")):
-                role_name = normalize_text(role_name)
+            for role_entry in collect_row_role_entries(row, df1_check):
+                role_name = role_entry["name"]
                 if not role_name or role_name in checked_roles:
                     continue
                 checked_roles.add(role_name)
-                if role_name not in existing_roles:
+                role_info = existing_roles.get(role_name)
+                if not role_info:
                     missing_roles.append(role_name)
+                    continue
+                desired_data_type = role_entry.get("dataType")
+                if desired_data_type and not role_matches_data_type(role_info, desired_data_type):
+                    print(
+                        f"   ⚠️  角色 {role_name} 已存在，但系统类型为 {role_info.get('dataType')}，"
+                        f"与表格要求的 {desired_data_type} 不一致"
+                    )
+                    has_error = True
+                    report["step1_roles"]["fail"].append(
+                        {
+                            "角色": role_name,
+                            "message": f"系统角色类型为 {role_info.get('dataType')}，与表格要求的 {desired_data_type} 不一致",
+                        }
+                    )
 
         if missing_roles:
             print("\n   ⚠️  以下角色当前在系统中不存在，执行时会自动创建：")
@@ -1435,7 +1885,7 @@ def main():
         else:
             print(f"   ✅ 角色管理列中的 {len(checked_roles)} 个角色都存在")
     else:
-        print("   ℹ️ 第一张表没有检测到“角色管理”列，跳过角色绑定预检")
+        print("   ℹ️ 第一张表没有检测到“角色管理/角色名称”列，跳过角色绑定预检")
 
     # 核对 03_单据表
     print("\n6️⃣ 核对 03_单据表...")
@@ -1470,6 +1920,38 @@ def main():
             report["preflight"]["doc_mismatch_03_only"] = sorted(mismatch2)
     else:
         print("   ℹ️ 02表未检测到“归属单据名称/费用角色名称”列，跳过02↔03单据名称一致性核对")
+
+    workflow_name_col = None
+    workflow_rows_present = False
+    try:
+        df_wf_check = read_sheet_with_header(xlsx, "审批流", "一级审批")
+        df_wf_check = filter_rows_by_optional_flag(df_wf_check, None, ["审批流名称", "一级审批", "二级审批", "三级审批", "抄送人"])
+        workflow_name_col = get_col(df_wf_check, "审批流名称")
+        workflow_rows_present = not df_wf_check.empty
+    except Exception:
+        df_wf_check = None
+
+    if workflow_rows_present:
+        workflow_doc_names = {
+            normalize_text(value)
+            for value in df_wf_check[workflow_name_col].tolist()
+            if normalize_text(value)
+        }
+        doc_names_from_03 = set(df3_check[get_col(df3_check, "单据模板名称")].dropna().unique())
+
+        workflow_only = workflow_doc_names - doc_names_from_03
+        if workflow_only:
+            print("\n   ⚠️  审批流表中有但03表中没有的单据名称：")
+            for doc_name in sorted(workflow_only):
+                print(f"      - {doc_name}")
+            report["preflight"]["workflow_doc_mismatch_only"] = sorted(workflow_only)
+
+        missing_workflow = doc_names_from_03 - workflow_doc_names
+        if missing_workflow:
+            print("\n   ⚠️  03表中有但审批流表中没有的单据名称：")
+            for doc_name in sorted(missing_workflow):
+                print(f"      - {doc_name}")
+            report["preflight"]["workflow_doc_missing"] = sorted(missing_workflow)
     
     report["preflight"]["has_risk"] = has_error
     if has_error:
@@ -1484,10 +1966,8 @@ def main():
     # Step1
     df1 = read_sheet_with_header(xlsx, "01_添加员工", "姓名")
     df1 = filter_rows_by_optional_flag(df1, "是否导入", ["姓名", "手机号"])
-    try:
-        role_col = get_col(df1, "角色管理")
-    except KeyError:
-        role_col = None
+    role_col = get_optional_col(df1, "角色管理")
+    role_name_col = get_optional_col(df1, "角色名称")
     existing_user_by_mobile = {}
     for u in users:
         mobile = normalize_mobile(u.get("mobile") or u.get("userName") or u.get("phone"))
@@ -1628,7 +2108,7 @@ def main():
                 }
             )
 
-    if role_col:
+    if role_col or role_name_col:
         role_bindings = {}
         existing_roles = role_nodes_map(company_id, h, cache=api_cache)
         for i, row in df1.iterrows():
@@ -1648,15 +2128,26 @@ def main():
                 path_cache=department_path_cache,
             )
 
-            for role_name in split_values(row.get(role_col, "")):
-                role_name = normalize_text(role_name)
+            for role_entry in collect_row_role_entries(row, df1):
+                role_name = normalize_text(role_entry.get("name"))
+                desired_data_type = role_entry.get("dataType")
                 if not role_name:
                     continue
                 role_info = existing_roles.get(role_name)
+                if role_info and desired_data_type and not role_matches_data_type(role_info, desired_data_type):
+                    report["step1_roles"]["fail"].append(
+                        {
+                            "row": int(i + 1),
+                            "姓名": name,
+                            "角色": role_name,
+                            "message": f"系统角色类型为 {role_info.get('dataType')}，与表格要求的 {desired_data_type} 不一致",
+                        }
+                    )
+                    continue
                 if not role_info:
-                    role_info = ensure_standard_role(role_name, company_id, h, cache=api_cache)
+                    role_info = ensure_standard_role(role_name, company_id, h, cache=api_cache, data_type=desired_data_type)
                     if role_info:
-                        existing_roles = role_nodes_map(company_id, h, cache=api_cache)
+                        existing_roles = role_nodes_map(company_id, h, cache=api_cache, force_refresh=True)
                         if role_name not in report["step1_roles"]["created_roles"]:
                             report["step1_roles"]["created_roles"].append(role_name)
                     else:
@@ -1982,22 +2473,165 @@ def main():
             )
 
     # Step2.5
-    wfs = requests.get(f"{BASE_URL}/api/bpm/workflow/queryWorkFlow", headers=h, params={"companyId": company_id, "size": 200}, timeout=12).json().get("result", []) or []
-    workflow_id = None
-    workflow_name = None
-    for w in wfs:
-        if "通用审批" in str(w.get("tpName", "")):
-            workflow_id = w.get("id")
-            workflow_name = w.get("tpName")
+    role_map_for_workflow = role_nodes_map(company_id, h, cache=api_cache, force_refresh=True)
+    role_detail_cache = {}
+    wfs = query_workflows(company_id, h)
+    workflow_by_doc = {
+        normalize_text(workflow.get("tpName")): workflow.get("id")
+        for workflow in wfs
+        if normalize_text(workflow.get("tpName")) and workflow.get("id")
+    }
+    workflow_docs_defined = set()
+    fallback_workflow_id = None
+    fallback_workflow_name = None
+    for workflow in wfs:
+        if "通用审批" in str(workflow.get("tpName", "")):
+            fallback_workflow_id = workflow.get("id")
+            fallback_workflow_name = workflow.get("tpName")
             break
-    if not workflow_id and wfs:
-        workflow_id = wfs[0].get("id")
-        workflow_name = wfs[0].get("tpName")
-    report["step25"] = {"workflowId": workflow_id, "workflowName": workflow_name, "count": len(wfs)}
+    if not fallback_workflow_id and wfs:
+        fallback_workflow_id = wfs[0].get("id")
+        fallback_workflow_name = wfs[0].get("tpName")
+
+    report["step25"]["count"] = len(wfs)
+    report["step25"]["workflowId"] = fallback_workflow_id
+    report["step25"]["workflowName"] = fallback_workflow_name
+
+    try:
+        df_wf = read_sheet_with_header(xlsx, "审批流", "一级审批")
+        df_wf = filter_rows_by_optional_flag(df_wf, None, ["审批流名称", "一级审批", "二级审批", "三级审批", "抄送人"])
+    except Exception:
+        df_wf = None
+
+    if df_wf is not None and not df_wf.empty:
+        workflow_name_col = get_col(df_wf, "审批流名称")
+        copy_name_col = get_optional_col(df_wf, "抄送人")
+        for _, row in df_wf.iterrows():
+            doc_name = normalize_text(row.get(workflow_name_col, ""))
+            if not doc_name:
+                continue
+            workflow_docs_defined.add(doc_name)
+
+            approval_specs = []
+            row_has_error = False
+            for level_label in ["一级审批", "二级审批", "三级审批"]:
+                raw_value = row.get(get_col(df_wf, level_label), "")
+                display_name = normalize_assignment_display(raw_value)
+                if not display_name:
+                    continue
+
+                target_spec = resolve_workflow_targets(
+                    raw_value,
+                    user_map,
+                    role_map_for_workflow,
+                    h,
+                    role_detail_cache=role_detail_cache,
+                )
+                row_errors = []
+                if target_spec["unknownTokens"]:
+                    row_errors.append(f"未识别对象: {'，'.join(target_spec['unknownTokens'])}")
+                if target_spec["extraDepartmentRoleNames"]:
+                    row_errors.append(f"同一节点不支持多个部门角色: {'，'.join(target_spec['departmentRoleNames'])}")
+                if target_spec["emptyCompanyRoles"]:
+                    row_errors.append(f"普通角色暂无成员: {'，'.join(target_spec['emptyCompanyRoles'])}")
+                if target_spec["roleMemberErrors"]:
+                    row_errors.extend(target_spec["roleMemberErrors"])
+                if not target_spec["userIds"] and not target_spec["departmentRole"]:
+                    row_errors.append("没有解析出可用审批对象")
+
+                if row_errors:
+                    report["step25"]["fail"].append(
+                        {
+                            "doc": doc_name,
+                            "node": level_label,
+                            "name": display_name,
+                            "message": "；".join(row_errors),
+                        }
+                    )
+                    row_has_error = True
+                    break
+
+                target_spec["displayName"] = display_name
+                approval_specs.append(target_spec)
+
+            if row_has_error:
+                continue
+            if not approval_specs:
+                report["step25"]["fail"].append({"doc": doc_name, "message": "审批流至少需要一个审批节点"})
+                continue
+
+            copy_spec = None
+            if copy_name_col:
+                raw_copy_value = row.get(copy_name_col, "")
+                copy_display = normalize_assignment_display(raw_copy_value)
+                if copy_display:
+                    copy_spec = resolve_workflow_targets(
+                        raw_copy_value,
+                        user_map,
+                        role_map_for_workflow,
+                        h,
+                        role_detail_cache=role_detail_cache,
+                    )
+                    copy_errors = []
+                    if copy_spec["unknownTokens"]:
+                        copy_errors.append(f"未识别对象: {'，'.join(copy_spec['unknownTokens'])}")
+                    if copy_spec["extraDepartmentRoleNames"]:
+                        copy_errors.append(f"同一抄送设置不支持多个部门角色: {'，'.join(copy_spec['departmentRoleNames'])}")
+                    if copy_spec["emptyCompanyRoles"]:
+                        copy_errors.append(f"普通角色暂无成员: {'，'.join(copy_spec['emptyCompanyRoles'])}")
+                    if copy_spec["roleMemberErrors"]:
+                        copy_errors.extend(copy_spec["roleMemberErrors"])
+                    if not copy_spec["userIds"] and not copy_spec["departmentRole"]:
+                        copy_errors.append("没有解析出可用抄送对象")
+                    if copy_errors:
+                        report["step25"]["fail"].append(
+                            {
+                                "doc": doc_name,
+                                "node": "抄送人",
+                                "name": copy_display,
+                                "message": "；".join(copy_errors),
+                            }
+                        )
+                        continue
+
+            existing_workflow_id = workflow_by_doc.get(doc_name)
+            workflow_json = build_workflow_json(doc_name, approval_specs, copy_spec, user_by_id)
+            workflow_resp = save_workflow(existing_workflow_id, doc_name, workflow_json, company_id, h)
+            if is_ok(workflow_resp):
+                saved_workflow_id = normalize_result_id(workflow_resp.get("result")) or existing_workflow_id
+                if saved_workflow_id:
+                    workflow_by_doc[doc_name] = saved_workflow_id
+                if existing_workflow_id:
+                    report["step25"]["updated"].append({"doc": doc_name, "workflowId": saved_workflow_id or existing_workflow_id})
+                else:
+                    report["step25"]["created"].append({"doc": doc_name, "workflowId": saved_workflow_id})
+            else:
+                report["step25"]["fail"].append(
+                    {
+                        "doc": doc_name,
+                        "message": workflow_resp.get("message") or "审批流保存失败",
+                    }
+                )
+
+        wfs = query_workflows(company_id, h)
+        workflow_by_doc.update(
+            {
+                normalize_text(workflow.get("tpName")): workflow.get("id")
+                for workflow in wfs
+                if normalize_text(workflow.get("tpName")) and workflow.get("id")
+            }
+        )
+        if not fallback_workflow_id and wfs:
+            fallback_workflow_id = wfs[0].get("id")
+            fallback_workflow_name = wfs[0].get("tpName")
+            report["step25"]["workflowId"] = fallback_workflow_id
+            report["step25"]["workflowName"] = fallback_workflow_name
+
+    report["step25"]["workflowByDoc"] = workflow_by_doc
 
     # 必须有审批流才能继续
-    if not workflow_id:
-        report["step3"]["fail"].append({"doc": "所有", "message": "系统中没有可用的审批流，请先创建审批流"})
+    if not fallback_workflow_id and not workflow_by_doc:
+        report["step3"]["fail"].append({"doc": "所有", "message": "系统中没有可用的审批流，且审批流表未成功创建审批流"})
         Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         print("❌ 导入失败：没有可用的审批流")
         print(json.dumps({
@@ -2037,6 +2671,12 @@ def main():
         doc_name = str(row.get(get_col(df3, "单据模板名称"), "")).strip()
         vis_type = str(row.get(get_col(df3, "可见范围类型"), "")).strip()
         vis_obj = str(row.get(get_col(df3, "可见范围对象"), "")).strip()
+        assigned_workflow_id = workflow_by_doc.get(doc_name)
+        if not assigned_workflow_id and doc_name not in workflow_docs_defined:
+            assigned_workflow_id = fallback_workflow_id
+        if not assigned_workflow_id:
+            report["step3"]["fail"].append({"doc": doc_name, "message": "未找到该单据可用的审批流，已跳过模板创建/更新"})
+            continue
 
         if group_name not in group_map:
             create_group_resp = requests.post(
@@ -2110,7 +2750,7 @@ def main():
             "type": bill_type,
             "userIds": user_ids if has_visibility else [],
             "userScopeFlag": has_visibility,
-            "workFlowId": workflow_id,
+            "workFlowId": assigned_workflow_id,
         }
         for extra_key in [
             "applyContentType",
@@ -2231,6 +2871,80 @@ def main():
             )
             print(f"   ❌ 页面保存失败：{doc_name} -> {'；'.join(save_errors) if save_errors else '未知错误'}")
 
+    # Step4
+    try:
+        df4 = read_sheet_with_header(xlsx, "权限", "权限名称")
+        df4 = filter_rows_by_optional_flag(df4, None, ["权限名称", "员工姓名"])
+    except Exception:
+        df4 = None
+
+    if df4 is not None and not df4.empty:
+        permission_rows = flatten_permission_rows(query_permission_tree(h))
+        permission_map = {
+            normalize_text(permission_row.get("name")): permission_row
+            for permission_row in permission_rows
+            if normalize_text(permission_row.get("name")) and permission_row.get("id")
+        }
+        role_map_for_permission = role_nodes_map(company_id, h, cache=api_cache, force_refresh=True)
+        permission_name_col = get_col(df4, "权限名称")
+        permission_actor_col = get_col(df4, "员工姓名")
+
+        for _, row in df4.iterrows():
+            permission_name = normalize_text(row.get(permission_name_col, ""))
+            if not permission_name:
+                continue
+
+            permission_row = permission_map.get(permission_name)
+            if not permission_row:
+                report["step4"]["fail"].append({"permission": permission_name, "message": "系统中未找到该权限项"})
+                continue
+            if permission_row.get("canEdit") is False:
+                report["step4"]["fail"].append({"permission": permission_name, "message": "该权限项当前不支持编辑"})
+                continue
+
+            resolved_targets = resolve_permission_targets(
+                row.get(permission_actor_col, ""),
+                user_map,
+                role_map_for_permission,
+            )
+            if resolved_targets["unknownTokens"]:
+                report["step4"]["fail"].append(
+                    {
+                        "permission": permission_name,
+                        "message": f"未识别对象: {'，'.join(resolved_targets['unknownTokens'])}",
+                    }
+                )
+                continue
+            if not resolved_targets["roleIds"] and not resolved_targets["userIds"]:
+                report["step4"]["fail"].append({"permission": permission_name, "message": "未解析出可添加的角色或员工"})
+                continue
+
+            existing_role_ids, existing_user_ids = extract_permission_actor_ids(permission_row)
+            merged_role_ids = merge_unique_ids(existing_role_ids, resolved_targets["roleIds"])
+            merged_user_ids = merge_unique_ids(existing_user_ids, resolved_targets["userIds"])
+            permission_resp = update_permission_targets(
+                permission_row.get("id"),
+                merged_role_ids,
+                merged_user_ids,
+                h,
+            )
+            if is_ok(permission_resp):
+                report["step4"]["ok"] += 1
+                report["step4"]["updated_permissions"].append(
+                    {
+                        "permission": permission_name,
+                        "roleNames": resolved_targets["roleNames"],
+                        "userNames": resolved_targets["userNames"],
+                    }
+                )
+            else:
+                report["step4"]["fail"].append(
+                    {
+                        "permission": permission_name,
+                        "message": permission_resp.get("message") or "权限更新失败",
+                    }
+                )
+
     Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print("✅ 导入完成")
     print(json.dumps({
@@ -2238,6 +2952,7 @@ def main():
         "step1_roles_ok": report["step1_roles"]["ok"],
         "step2_relations_ok": report["step2"]["relations_ok"],
         "step3_ok": report["step3"]["ok"],
+        "step4_ok": report["step4"]["ok"],
         "output": args.output,
     }, ensure_ascii=False, indent=2))
 
