@@ -1160,23 +1160,54 @@ def _normalize_label(value):
 
 
 def get_col(df, target):
+    """Find a column in df by a human label.
+
+    We accept:
+    - exact match
+    - substring match
+    - normalized match (punctuation/whitespace tolerant)
+
+    Backward-compatibility:
+    - If a template drops a leading prefix like "单据" (e.g. "适配人员" instead of "单据适配人员"),
+      try again with common relaxed aliases.
+    """
     target = str(target).strip()
     norm_target = _normalize_label(target)
-    for col in df.columns:
-        c = str(col).strip()
-        if c == target:
-            return col
-    for col in df.columns:
-        c = str(col).strip()
-        if target in c:
-            return col
-    for col in df.columns:
-        c = str(col).strip()
-        if not c:
-            continue
-        norm_col = _normalize_label(c)
-        if norm_col == norm_target or norm_target in norm_col or norm_col in norm_target:
-            return col
+
+    def _search(t, nt):
+        for col in df.columns:
+            c = str(col).strip()
+            if c == t:
+                return col
+        for col in df.columns:
+            c = str(col).strip()
+            if t and t in c:
+                return col
+        for col in df.columns:
+            c = str(col).strip()
+            if not c:
+                continue
+            norm_col = _normalize_label(c)
+            if norm_col == nt or nt in norm_col or norm_col in nt:
+                return col
+        return None
+
+    found = _search(target, norm_target)
+    if found is not None:
+        return found
+
+    # relaxed aliases
+    aliases = []
+    if target.startswith("单据"):
+        aliases.append(target.replace("单据", "", 1).strip())
+    if target == "单据适配人员":
+        aliases.extend(["适配人员", "适配人员（多人用中文逗号）", "适配人员(多人用中文逗号)"])
+
+    for a in aliases:
+        fa = _search(a, _normalize_label(a))
+        if fa is not None:
+            return fa
+
     raise KeyError(target)
 
 
@@ -1327,7 +1358,8 @@ def main():
     df2_check = filter_rows_by_optional_flag(
         df2_check,
         "是否执行",
-        ["一级费用科目", "二级费用科目", "三级费用科目", "归属单据名称", "单据适配人员"],
+        # 新模板可能不再要求“归属单据名称”列（而是用“费用角色名称”绑定到单据模板）
+        ["一级费用科目", "二级费用科目", "三级费用科目", "费用角色名称", "单据适配人员"],
     )
     
     # 核对一级费用科目
@@ -1410,23 +1442,34 @@ def main():
     df3_check = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
     df3_check = filter_rows_by_optional_flag(df3_check, "是否创建", ["单据分组（一级目录）", "单据模板名称"])
     
-    # 检查单据模板名称是否与02表的归属单据名称匹配
-    doc_names_from_02 = set(df2_check[get_col(df2_check, "归属单据名称")].dropna().unique())
-    doc_names_from_03 = set(df3_check[get_col(df3_check, "单据模板名称")].dropna().unique())
-    
-    mismatch = doc_names_from_02 - doc_names_from_03
-    if mismatch:
-        print(f"\n   ⚠️  02表中有但03表中没有的单据名称：")
-        for d in mismatch:
-            print(f"      - {d}")
-        report["preflight"]["doc_mismatch_02_only"] = sorted(mismatch)
+    # 检查单据模板名称是否与02表中的“归属单据名称/费用角色名称”匹配
+    col_02_doc = None
+    for candidate in ("归属单据名称", "费用角色名称", "费用角色名称（与单据模版名称保持三致）"):
+        try:
+            col_02_doc = get_col(df2_check, candidate)
+            break
+        except KeyError:
+            continue
 
-    mismatch2 = doc_names_from_03 - doc_names_from_02
-    if mismatch2:
-        print(f"\n   ⚠️  03表中有但02表中没有的单据名称：")
-        for d in mismatch2:
-            print(f"      - {d}")
-        report["preflight"]["doc_mismatch_03_only"] = sorted(mismatch2)
+    if col_02_doc:
+        doc_names_from_02 = set(df2_check[col_02_doc].dropna().unique())
+        doc_names_from_03 = set(df3_check[get_col(df3_check, "单据模板名称")].dropna().unique())
+
+        mismatch = doc_names_from_02 - doc_names_from_03
+        if mismatch:
+            print(f"\n   ⚠️  02表中有但03表中没有的单据名称：")
+            for d in mismatch:
+                print(f"      - {d}")
+            report["preflight"]["doc_mismatch_02_only"] = sorted(mismatch)
+
+        mismatch2 = doc_names_from_03 - doc_names_from_02
+        if mismatch2:
+            print(f"\n   ⚠️  03表中有但02表中没有的单据名称：")
+            for d in mismatch2:
+                print(f"      - {d}")
+            report["preflight"]["doc_mismatch_03_only"] = sorted(mismatch2)
+    else:
+        print("   ℹ️ 02表未检测到“归属单据名称/费用角色名称”列，跳过02↔03单据名称一致性核对")
     
     report["preflight"]["has_risk"] = has_error
     if has_error:
@@ -1695,7 +1738,8 @@ def main():
     df2 = filter_rows_by_optional_flag(
         df2,
         "是否执行",
-        ["一级费用科目", "二级费用科目", "三级费用科目", "归属单据名称", "单据适配人员"],
+        # 新模板可能使用“费用角色名称”替代“归属单据名称”作为单据/角色绑定键
+        ["一级费用科目", "二级费用科目", "三级费用科目", "费用角色名称", "单据适配人员"],
     )
     for c in [get_col(df2, "一级费用科目"), get_col(df2, "二级费用科目")]:
         df2[c] = df2[c].ffill()
@@ -1723,8 +1767,14 @@ def main():
     row_role_bindings = []
     seen_row_bindings = set()
 
+    # 兼容列名：归属单据名称 / 费用角色名称
+    try:
+        doc_col = get_col(df2, "归属单据名称")
+    except KeyError:
+        doc_col = get_col(df2, "费用角色名称")
+
     for _, row in df2.iterrows():
-        doc = normalize_text(row.get(get_col(df2, "归属单据名称"), ""))
+        doc = normalize_text(row.get(doc_col, ""))
         people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
         if not (doc and people):
             continue
@@ -1742,7 +1792,7 @@ def main():
         s = normalize_text(row.get(get_col(df2, "二级费用科目"), ""))
         t3 = normalize_text(row.get(get_col(df2, "三级费用科目"), ""))
         t4 = normalize_text(row.get(get_col(df2, "四级费用科目"), "")) if any("四级费用科目" in str(c) for c in df2.columns) else ""
-        doc = normalize_text(row.get(get_col(df2, "归属单据名称"), ""))
+        doc = normalize_text(row.get(doc_col, ""))
         people = split_values(row.get(get_col(df2, "单据适配人员"), ""))
         if not (p and s):
             continue
