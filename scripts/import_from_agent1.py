@@ -1323,6 +1323,14 @@ def normalize_assignment_display(value):
     return "，".join(split_values(value))
 
 
+def is_instruction_like_text(value):
+    text = normalize_text(value)
+    if not text:
+        return False
+    hints = ["说明", "示例", "仅为示例", "根据企业具体管理流程需要制定"]
+    return any(hint in text for hint in hints)
+
+
 def query_workflows(company_id, headers):
     resp = requests.get(
         f"{BASE_URL}/api/bpm/workflow/queryWorkFlow",
@@ -1350,10 +1358,11 @@ def save_workflow(workflow_id, workflow_name, workflow_json, company_id, headers
     ).json()
 
 
-def query_permission_tree(headers):
+def query_permission_tree(company_id, headers):
     resp = requests.get(
         f"{BASE_URL}/api/member/permission/tree",
         headers=headers,
+        params={"companyId": company_id},
         timeout=15,
     ).json()
     if is_ok(resp):
@@ -1361,7 +1370,7 @@ def query_permission_tree(headers):
     return []
 
 
-def update_permission_targets(permission_group_id, role_ids, user_ids, headers):
+def update_permission_targets(permission_group_id, role_ids, user_ids, company_id, headers):
     return requests.post(
         f"{BASE_URL}/api/member/permission/update",
         headers=headers,
@@ -1369,6 +1378,7 @@ def update_permission_targets(permission_group_id, role_ids, user_ids, headers):
             "permissionGroupId": permission_group_id,
             "roleIds": unique_list(role_ids),
             "userIds": unique_list(user_ids),
+            "companyId": company_id,
         },
         timeout=15,
     ).json()
@@ -1387,6 +1397,23 @@ def flatten_permission_rows(nodes):
 
     walk(nodes)
     return rows
+
+
+def permission_row_keys(permission_row):
+    keys = []
+    for value in [permission_row.get("name"), permission_row.get("description")]:
+        normalized = normalize_text(value)
+        if normalized:
+            keys.append(normalized)
+    return unique_list(keys)
+
+
+def build_permission_row_map(permission_rows):
+    row_map = {}
+    for permission_row in permission_rows:
+        for key in permission_row_keys(permission_row):
+            row_map.setdefault(key, permission_row)
+    return row_map
 
 
 def extract_permission_actor_ids(permission_row):
@@ -1927,6 +1954,10 @@ def main():
         df_wf_check = read_sheet_with_header(xlsx, "审批流", "一级审批")
         df_wf_check = filter_rows_by_optional_flag(df_wf_check, None, ["审批流名称", "一级审批", "二级审批", "三级审批", "抄送人"])
         workflow_name_col = get_col(df_wf_check, "审批流名称")
+        if workflow_name_col:
+            df_wf_check = df_wf_check[
+                ~df_wf_check[workflow_name_col].apply(is_instruction_like_text)
+            ].copy()
         workflow_rows_present = not df_wf_check.empty
     except Exception:
         df_wf_check = None
@@ -2505,6 +2536,10 @@ def main():
 
     if df_wf is not None and not df_wf.empty:
         workflow_name_col = get_col(df_wf, "审批流名称")
+        if workflow_name_col:
+            df_wf = df_wf[
+                ~df_wf[workflow_name_col].apply(is_instruction_like_text)
+            ].copy()
         copy_name_col = get_optional_col(df_wf, "抄送人")
         for _, row in df_wf.iterrows():
             doc_name = normalize_text(row.get(workflow_name_col, ""))
@@ -2879,19 +2914,18 @@ def main():
         df4 = None
 
     if df4 is not None and not df4.empty:
-        permission_rows = flatten_permission_rows(query_permission_tree(h))
-        permission_map = {
-            normalize_text(permission_row.get("name")): permission_row
-            for permission_row in permission_rows
-            if normalize_text(permission_row.get("name")) and permission_row.get("id")
-        }
+        permission_rows = flatten_permission_rows(query_permission_tree(company_id, h))
+        permission_map = build_permission_row_map(permission_rows)
         role_map_for_permission = role_nodes_map(company_id, h, cache=api_cache, force_refresh=True)
         permission_name_col = get_col(df4, "权限名称")
         permission_actor_col = get_col(df4, "员工姓名")
 
         for _, row in df4.iterrows():
             permission_name = normalize_text(row.get(permission_name_col, ""))
+            actor_text = normalize_text(row.get(permission_actor_col, ""))
             if not permission_name:
+                continue
+            if not actor_text:
                 continue
 
             permission_row = permission_map.get(permission_name)
@@ -2903,7 +2937,7 @@ def main():
                 continue
 
             resolved_targets = resolve_permission_targets(
-                row.get(permission_actor_col, ""),
+                actor_text,
                 user_map,
                 role_map_for_permission,
             )
@@ -2926,6 +2960,7 @@ def main():
                 permission_row.get("id"),
                 merged_role_ids,
                 merged_user_ids,
+                company_id,
                 h,
             )
             if is_ok(permission_resp):
