@@ -1466,6 +1466,7 @@ def resolve_workflow_targets(raw_value, user_map, role_map, headers, role_detail
     expanded_user_ids = list(direct_user_ids)
     empty_company_roles = []
     role_member_errors = []
+    company_role_member_ids = {}
     for role_info in company_roles:
         member_user_ids, _ = get_standard_role_member_ids(role_info, headers, role_detail_cache=role_detail_cache)
         if member_user_ids is None:
@@ -1474,15 +1475,38 @@ def resolve_workflow_targets(raw_value, user_map, role_map, headers, role_detail
         if not member_user_ids:
             empty_company_roles.append(role_info.get("name"))
             continue
-        expanded_user_ids = merge_unique_ids(expanded_user_ids, member_user_ids)
+        company_role_member_ids[role_info.get("id")] = unique_list(member_user_ids)
+
+    selected_role = None
+    if department_roles:
+        selected_role = department_roles[0]
+        # A mixed "普通角色 + 部门角色" node only has one role-match slot in the
+        # current workflow JSON, so we keep the department role as the role match
+        # and expand ordinary-role members as designated approvers.
+        for role_info in company_roles:
+            expanded_user_ids = merge_unique_ids(
+                expanded_user_ids,
+                company_role_member_ids.get(role_info.get("id")) or [],
+            )
+    elif company_roles:
+        selected_role = company_roles[0]
+        # If multiple ordinary roles are provided, keep the first one as role match
+        # and expand any extras to concrete staff so everyone is still included.
+        for role_info in company_roles[1:]:
+            expanded_user_ids = merge_unique_ids(
+                expanded_user_ids,
+                company_role_member_ids.get(role_info.get("id")) or [],
+            )
 
     return {
         "tokens": tokens,
         "displayName": "，".join(tokens),
         "userIds": unique_list(expanded_user_ids),
+        "selectedRole": selected_role,
         "departmentRole": department_roles[0] if department_roles else None,
         "departmentRoleNames": [normalize_text(role.get("name")) for role in department_roles],
         "extraDepartmentRoleNames": [normalize_text(role.get("name")) for role in department_roles[1:]],
+        "companyRole": company_roles[0] if company_roles else None,
         "companyRoleNames": [normalize_text(role.get("name")) for role in company_roles],
         "unknownTokens": unknown_tokens,
         "emptyCompanyRoles": empty_company_roles,
@@ -1667,7 +1691,7 @@ def build_workflow_json(workflow_name, approval_specs, copy_spec, user_by_id):
         apply_workflow_target_to_selections(
             node["COUNTERSIGN"]["SELECTIONS"],
             spec.get("userIds") or [],
-            spec.get("departmentRole"),
+            spec.get("selectedRole"),
             user_by_id,
         )
         nodes.append(node)
@@ -1679,7 +1703,7 @@ def build_workflow_json(workflow_name, approval_specs, copy_spec, user_by_id):
             apply_workflow_target_to_selections(
                 last_node["CARBON_COPY"][0]["SELECTIONS"],
                 copy_spec.get("userIds") or [],
-                copy_spec.get("departmentRole"),
+                copy_spec.get("selectedRole"),
                 user_by_id,
             )
 
@@ -2571,7 +2595,7 @@ def main():
                     row_errors.append(f"普通角色暂无成员: {'，'.join(target_spec['emptyCompanyRoles'])}")
                 if target_spec["roleMemberErrors"]:
                     row_errors.extend(target_spec["roleMemberErrors"])
-                if not target_spec["userIds"] and not target_spec["departmentRole"]:
+                if not target_spec["userIds"] and not target_spec["selectedRole"]:
                     row_errors.append("没有解析出可用审批对象")
 
                 if row_errors:
@@ -2616,7 +2640,7 @@ def main():
                         copy_errors.append(f"普通角色暂无成员: {'，'.join(copy_spec['emptyCompanyRoles'])}")
                     if copy_spec["roleMemberErrors"]:
                         copy_errors.extend(copy_spec["roleMemberErrors"])
-                    if not copy_spec["userIds"] and not copy_spec["departmentRole"]:
+                    if not copy_spec["userIds"] and not copy_spec["selectedRole"]:
                         copy_errors.append("没有解析出可用抄送对象")
                     if copy_errors:
                         report["step25"]["fail"].append(
