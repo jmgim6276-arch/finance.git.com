@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import base64
 from copy import deepcopy
 import getpass
 import hashlib
@@ -6,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -37,6 +39,10 @@ BROWSERS = [
 
 _LOCAL_HTTP = requests.Session()
 _LOCAL_HTTP.trust_env = False
+
+CAPTCHA_EXPECTED_LENGTH = 5
+CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_OCR_SCRIPT = Path(__file__).with_name("ocr_captcha.swift")
 
 STATIC_DEFAULT_BILL_MODELS = {
     "EXPENSE": {
@@ -1107,23 +1113,62 @@ def wait_for(condition, timeout=20, interval=1):
     return None
 
 
+def normalize_captcha_code(value):
+    if not value:
+        return ""
+    return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
+
+
+def get_login_form_state(page):
+    raw = cdp_eval(
+        page,
+        """
+        (() => {
+          function visible(el) {
+            return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+          }
+
+          const pwdTab = [...document.querySelectorAll('.el-tabs__item')]
+            .find(el => visible(el) && (el.innerText || '').includes('密码'));
+          if (pwdTab && !pwdTab.classList.contains('is-active')) {
+            pwdTab.click();
+          }
+
+          const inputs = [...document.querySelectorAll('input')].filter(visible);
+          const usernameInput = inputs.find(i => (i.placeholder || '').includes('手机号'));
+          const passwordInput = inputs.find(i => (i.placeholder || '').includes('密码') && !(i.placeholder || '').includes('短信'));
+          const captchaInput = inputs.find(i => (i.placeholder || '').includes('验证码') && !(i.placeholder || '').includes('短信'));
+          const button = [...document.querySelectorAll('button')]
+            .filter(visible)
+            .find(b => (b.innerText || '').includes('登录'));
+          const captchaImage = [...document.querySelectorAll('img')]
+            .filter(visible)
+            .find(img => (img.src || '').startsWith('data:image'));
+          const messages = [
+            ...[...document.querySelectorAll('.el-form-item__error')].map(el => (el.innerText || el.textContent || '').trim()),
+            ...[...document.querySelectorAll('.el-message, .ivu-message')].map(el => (el.innerText || el.textContent || '').trim())
+          ].filter(Boolean);
+
+          return JSON.stringify({
+            url: location.href,
+            ready: !!usernameInput && !!passwordInput && !!button,
+            hasCaptcha: !!captchaInput && !!captchaImage,
+            captchaImageSrc: captchaImage ? captchaImage.src : null,
+            messages,
+            placeholders: inputs.map(i => i.placeholder || '')
+          });
+        })()
+        """,
+    )
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        return {}
+
+
 def wait_for_login_form(page, timeout=20):
     def _ready():
-        state = cdp_eval(
-            page,
-            """
-            JSON.stringify({
-              url: location.href,
-              ready: [...document.querySelectorAll('input')].some(i => (i.placeholder || '').includes('手机号'))
-                && [...document.querySelectorAll('input')].some(i => (i.placeholder || '').includes('密码'))
-                && [...document.querySelectorAll('button')].some(b => (b.innerText || '').includes('登录'))
-            })
-            """,
-        )
-        try:
-            info = json.loads(state or "{}")
-        except Exception:
-            return None
+        info = get_login_form_state(page)
         return info if info.get("ready") else None
 
     return wait_for(_ready, timeout=timeout, interval=1)
@@ -1145,13 +1190,188 @@ def force_login_page(page):
     )
 
 
-def submit_login(page, username, password):
+def save_data_url_image(data_url):
+    if not data_url or "," not in data_url:
+        raise RuntimeError("未读取到验证码图片数据")
+    header, payload = data_url.split(",", 1)
+    suffix = ".gif" if "gif" in header.lower() else ".png"
+    with tempfile.NamedTemporaryFile(prefix="cst_captcha_", suffix=suffix, delete=False) as tmp:
+        tmp.write(base64.b64decode(payload))
+        return Path(tmp.name)
+
+
+def recognize_captcha_image(image_path):
+    if not CAPTCHA_OCR_SCRIPT.exists():
+        raise RuntimeError(f"验证码 OCR 脚本不存在：{CAPTCHA_OCR_SCRIPT}")
+    try:
+        result = subprocess.run(
+            ["swift", str(CAPTCHA_OCR_SCRIPT), str(image_path)],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("当前机器缺少 swift，无法自动识别财税通验证码") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("验证码 OCR 超时，未能在 40 秒内完成识别") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"验证码 OCR 执行失败：{detail or '未知错误'}")
+
+    try:
+        info = json.loads((result.stdout or "").strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"验证码 OCR 输出无法解析：{(result.stdout or '').strip()}") from exc
+
+    if not info.get("ok"):
+        raise RuntimeError(info.get("error") or "验证码 OCR 未返回有效结果")
+
+    candidates = []
+    for item in info.get("candidates") or []:
+        if isinstance(item, dict):
+            value = normalize_captcha_code(item.get("value"))
+        else:
+            value = normalize_captcha_code(item)
+        if value:
+            candidates.append(value)
+    return {
+        "code": normalize_captcha_code(info.get("code")),
+        "candidates": candidates,
+        "raw": info,
+    }
+
+
+def solve_login_captcha(page):
+    state = get_login_form_state(page)
+    data_url = state.get("captchaImageSrc")
+    if not data_url:
+        return {"ok": False, "reason": "captcha-image-not-found", "state": state}
+
+    image_path = save_data_url_image(data_url)
+    try:
+        ocr = recognize_captcha_image(image_path)
+    finally:
+        try:
+            image_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    candidates = [code for code in [ocr.get("code"), *(ocr.get("candidates") or [])] if code]
+    best = next((code for code in candidates if len(code) == CAPTCHA_EXPECTED_LENGTH), "")
+    if not best and candidates:
+        best = candidates[0]
+    return {
+        "ok": len(best) == CAPTCHA_EXPECTED_LENGTH,
+        "code": best,
+        "state": state,
+        "ocr": ocr,
+    }
+
+
+def refresh_login_captcha(page, previous_src=None, timeout=8):
+    previous_src = previous_src or get_login_form_state(page).get("captchaImageSrc")
+    raw = cdp_eval(
+        page,
+        """
+        (() => {
+          function visible(el) {
+            return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+          }
+          const captchaImage = [...document.querySelectorAll('img')]
+            .filter(visible)
+            .find(img => (img.src || '').startsWith('data:image'));
+          if (!captchaImage) {
+            return JSON.stringify({ ok: false, reason: 'captcha-image-not-found' });
+          }
+          captchaImage.click();
+          return JSON.stringify({ ok: true, src: captchaImage.src });
+        })()
+        """,
+    )
+    try:
+        info = json.loads(raw or "{}")
+    except Exception:
+        info = {"ok": False, "reason": "invalid-json"}
+    if not info.get("ok"):
+        return None
+
+    def _changed():
+        state = get_login_form_state(page)
+        src = state.get("captchaImageSrc")
+        if src and src != previous_src:
+            return state
+        return None
+
+    return wait_for(_changed, timeout=timeout, interval=0.5)
+
+
+def classify_login_messages(messages):
+    text = "；".join([msg for msg in (messages or []) if msg])
+    if not text:
+        return "login-error"
+    if "验证码" in text:
+        return "captcha-error"
+    if "账号" in text or "密码" in text or "用户名" in text:
+        return "credential-error"
+    return "login-error"
+
+
+def wait_for_login_outcome(page, previous_captcha_src=None, before_messages=None, timeout=12, interval=0.5):
+    deadline = time.time() + timeout
+    before_set = set(before_messages or [])
+    last_state = {}
+    while time.time() < deadline:
+        token2, company_id2, user_id2, _ = extract_auth(page)
+        if token2:
+            return {
+                "ok": True,
+                "token": token2,
+                "companyId": company_id2,
+                "userId": user_id2,
+            }
+
+        state = get_login_form_state(page)
+        last_state = state or {}
+        messages = [msg for msg in (last_state.get("messages") or []) if msg]
+        new_messages = [msg for msg in messages if msg not in before_set]
+        if new_messages:
+            return {
+                "ok": False,
+                "reason": classify_login_messages(new_messages),
+                "messages": new_messages,
+                "state": last_state,
+            }
+        current_src = last_state.get("captchaImageSrc")
+        if previous_captcha_src and current_src and current_src != previous_captcha_src:
+            return {
+                "ok": False,
+                "reason": "captcha-refreshed",
+                "messages": messages,
+                "state": last_state,
+            }
+        time.sleep(interval)
+
+    return {
+        "ok": False,
+        "reason": "timeout",
+        "messages": [msg for msg in (last_state.get("messages") or []) if msg],
+        "state": last_state,
+    }
+
+
+def submit_login(page, username, password, captcha_code=None):
     payload = {
         "username": username,
         "password": password,
+        "captchaCode": captcha_code or "",
     }
     script = f"""
     (() => {{
+      function visible(el) {{
+        return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+      }}
       function setNativeValue(el, value) {{
         const proto = Object.getPrototypeOf(el);
         const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
@@ -1166,21 +1386,31 @@ def submit_login(page, username, password):
 
       const payload = {json.dumps(payload, ensure_ascii=False)};
       const pwdTab = [...document.querySelectorAll('.el-tabs__item')]
-        .find(el => (el.innerText || '').includes('密码'));
+        .find(el => visible(el) && (el.innerText || '').includes('密码'));
       if (pwdTab && !pwdTab.classList.contains('is-active')) {{
         pwdTab.click();
       }}
-      const usernameInput = [...document.querySelectorAll('input')]
+      const inputs = [...document.querySelectorAll('input')].filter(visible);
+      const usernameInput = inputs
         .find(i => (i.placeholder || '').includes('手机号'));
-      const passwordInput = [...document.querySelectorAll('input')]
-        .find(i => (i.placeholder || '').includes('密码'));
+      const passwordInput = inputs
+        .find(i => (i.placeholder || '').includes('密码') && !(i.placeholder || '').includes('短信'));
+      const captchaInput = inputs
+        .find(i => (i.placeholder || '').includes('验证码') && !(i.placeholder || '').includes('短信'));
       const button = [...document.querySelectorAll('button')]
+        .filter(visible)
         .find(b => (b.innerText || '').includes('登录'));
       if (!usernameInput || !passwordInput || !button) {{
         return JSON.stringify({{ ok: false, reason: 'login-form-not-found' }});
       }}
+      if (captchaInput && !payload.captchaCode) {{
+        return JSON.stringify({{ ok: false, reason: 'captcha-required' }});
+      }}
       setNativeValue(usernameInput, payload.username);
       setNativeValue(passwordInput, payload.password);
+      if (captchaInput) {{
+        setNativeValue(captchaInput, payload.captchaCode);
+      }}
       button.click();
       return JSON.stringify({{ ok: true }});
     }})()
@@ -1531,22 +1761,92 @@ def ensure_login(
         )
 
     force_login_page(page)
-    if not wait_for_login_form(page, timeout=20):
+    login_form = wait_for_login_form(page, timeout=20)
+    if not login_form:
         raise RuntimeError("登录页未就绪，无法自动填写账号密码")
 
-    submit = submit_login(page, username=username, password=password)
-    if not submit.get("ok"):
-        raise RuntimeError(f"自动提交登录失败：{submit}")
+    logged_in = None
+    failures = []
+    max_attempts = CAPTCHA_MAX_ATTEMPTS if login_form.get("hasCaptcha") else 1
+    for attempt in range(1, max_attempts + 1):
+        state = get_login_form_state(page) or {}
+        before_messages = state.get("messages") or []
+        captcha_src = state.get("captchaImageSrc")
+        captcha_code = None
 
-    def _login_ready():
-        token2, company_id2, user_id2, _ = extract_auth(page)
-        if token2:
-            return token2, company_id2, user_id2
-        return None
+        if state.get("hasCaptcha"):
+            solved = solve_login_captcha(page)
+            captcha_code = solved.get("code")
+            if not solved.get("ok"):
+                failures.append(
+                    {
+                        "attempt": attempt,
+                        "reason": "captcha-ocr-failed",
+                        "messages": before_messages,
+                    }
+                )
+                refresh_login_captcha(page, previous_src=captcha_src)
+                continue
 
-    logged_in = wait_for(_login_ready, timeout=20, interval=1)
+        submit = submit_login(page, username=username, password=password, captcha_code=captcha_code)
+        if not submit.get("ok"):
+            if submit.get("reason") == "captcha-required":
+                failures.append(
+                    {
+                        "attempt": attempt,
+                        "reason": "captcha-required",
+                        "messages": before_messages,
+                    }
+                )
+                refresh_login_captcha(page, previous_src=captcha_src)
+                continue
+            raise RuntimeError(f"自动提交登录失败：{submit}")
+
+        outcome = wait_for_login_outcome(
+            page,
+            previous_captcha_src=captcha_src,
+            before_messages=before_messages,
+            timeout=12,
+            interval=0.5,
+        )
+        if outcome.get("ok"):
+            logged_in = (
+                outcome.get("token"),
+                outcome.get("companyId"),
+                outcome.get("userId"),
+            )
+            break
+
+        failures.append(
+            {
+                "attempt": attempt,
+                "reason": outcome.get("reason"),
+                "messages": outcome.get("messages") or [],
+            }
+        )
+        if outcome.get("reason") == "credential-error":
+            detail = "；".join(outcome.get("messages") or []) or "页面提示账号或密码错误"
+            raise RuntimeError(f"自动登录失败：{detail}")
+        if state.get("hasCaptcha"):
+            latest_src = ((outcome.get("state") or {}).get("captchaImageSrc")) or captcha_src
+            refresh_login_captcha(page, previous_src=latest_src)
+
     if not logged_in:
-        raise RuntimeError("自动登录后未能读取到 token，请检查账号密码是否正确")
+        latest = failures[-1] if failures else {}
+        detail = "；".join(latest.get("messages") or [])
+        captcha_like = any(
+            failure.get("reason") in {"captcha-ocr-failed", "captcha-required", "captcha-error", "captcha-refreshed"}
+            for failure in failures
+        )
+        if captcha_like:
+            raise RuntimeError(
+                f"自动登录未成功：登录页需要验证码，脚本已尝试 {max_attempts} 次自动识别"
+                + (f"；最新页面提示：{detail}" if detail else "")
+            )
+        raise RuntimeError(
+            "自动登录后未能读取到 token"
+            + (f"；最新页面提示：{detail}" if detail else "")
+        )
 
     token, selected_company_id, user_id = logged_in
     token, selected_company_id, user_id, auth_data = extract_auth(page)
