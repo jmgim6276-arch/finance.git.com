@@ -1713,6 +1713,56 @@ def ui_save_bill_template(doc_name, preferred_browser="auto", reload_page=False)
     return ui_save_bill_template_on_page(page, doc_name)
 
 
+def ui_template_name_id_map(preferred_browser="auto", reload_page=False):
+    browser = find_browser(preferred=preferred_browser, require_cst=True)
+    if not browser:
+        raise RuntimeError("未找到已登录的财税通浏览器页面，无法读取页面模板树")
+    page = ensure_bill_template_page(browser, reload_page=reload_page)
+    raw = cdp_eval(
+        page,
+        """
+        (() => {
+          function findVm(vm, predicate) {
+            if (!vm) return null;
+            if (predicate(vm)) return vm;
+            for (const child of (vm.$children || [])) {
+              const found = findVm(child, predicate);
+              if (found) return found;
+            }
+            return null;
+          }
+          function flatten(nodes, out = []) {
+            for (const node of (nodes || [])) {
+              const name = (node.name || node.title || '').trim();
+              if (name && node.id) {
+                out.push({ id: node.id, name });
+              }
+              flatten(node.children || [], out);
+            }
+            return out;
+          }
+          const root = document.querySelector('#app') && document.querySelector('#app').__vue__;
+          if (!root) return JSON.stringify({ ok: false, reason: 'vue-root-not-found' });
+          const billsVm = findVm(root, vm => vm.$options && vm.$options.methods && typeof vm.$options.methods.fnClickBillItem === 'function');
+          if (!billsVm || !billsVm.$store) return JSON.stringify({ ok: false, reason: 'bills-component-not-found' });
+          const tree = (((billsVm.$store || {}).state || {}).bills || {}).tmplTreeData || [];
+          return JSON.stringify({ ok: true, items: flatten(tree) });
+        })()
+        """,
+    )
+    info = json.loads(raw or "{}")
+    if not info.get("ok"):
+        raise RuntimeError(f"读取页面模板树失败：{info}")
+
+    name_to_id = {}
+    for item in info.get("items") or []:
+        name = str(item.get("name") or "").strip()
+        item_id = item.get("id")
+        if name and item_id and name not in name_to_id:
+            name_to_id[name] = item_id
+    return name_to_id
+
+
 def ensure_login(
     preferred_browser="auto",
     username=None,

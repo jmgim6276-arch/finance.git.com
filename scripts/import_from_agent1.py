@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 from openpyxl import load_workbook
 
-from browser_session import BASE_URL, get_auth, get_default_bill_model, ui_save_bill_template
+from browser_session import BASE_URL, get_auth, get_default_bill_model, ui_save_bill_template, ui_template_name_id_map
 
 
 def is_ok(resp):
@@ -978,6 +978,14 @@ def template_defaults_from_model(bill_type, default_model):
     return defaults
 
 
+def default_bill_model_source(default_model):
+    return normalize_text((default_model or {}).get("_source")).lower()
+
+
+def uses_fallback_bill_model(default_model):
+    return default_bill_model_source(default_model).startswith("fallback")
+
+
 _TEMPLATE_UPDATE_ALLOWLIST = {
     "applyContentType",
     "applyRelateFlag",
@@ -1331,6 +1339,52 @@ def is_instruction_like_text(value):
     return any(hint in text for hint in hints)
 
 
+def workflow_name_variants(value):
+    text = normalize_text(value)
+    if not text:
+        return []
+
+    variants = [text]
+    stripped = re.sub(r"^\d+[\s._-]*", "", text).strip()
+    if stripped and stripped != text:
+        variants.append(stripped)
+
+    return unique_list(variants)
+
+
+def resolve_workflow_template_name(value, template_names=None):
+    variants = workflow_name_variants(value)
+    if not variants:
+        return ""
+
+    template_names = template_names or set()
+    for candidate in variants:
+        if candidate in template_names:
+            return candidate
+
+    if template_names:
+        suffix_matches = [name for name in template_names if variants[0].endswith(name)]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+
+    return variants[0]
+
+
+def build_workflow_doc_map(workflows, template_names=None):
+    workflow_map = {}
+    for workflow in workflows or []:
+        workflow_id = workflow.get("id")
+        raw_name = normalize_text(workflow.get("tpName"))
+        if not raw_name or not workflow_id:
+            continue
+
+        workflow_map.setdefault(raw_name, workflow_id)
+        matched_name = resolve_workflow_template_name(raw_name, template_names)
+        if matched_name and matched_name != raw_name:
+            workflow_map.setdefault(matched_name, workflow_id)
+    return workflow_map
+
+
 def query_workflows(company_id, headers):
     resp = requests.get(
         f"{BASE_URL}/api/bpm/workflow/queryWorkFlow",
@@ -1655,7 +1709,7 @@ def workflow_end_node():
             "VALUE": "REQUISITION",
             "TYPE": "STRING",
         },
-        "OTHER_CONFIG": {"cashNodeAutoComplete": False},
+        "OTHER_CONFIG": {"cashNodeAutoComplete": True},
     }
 
 
@@ -1696,18 +1750,17 @@ def build_workflow_json(workflow_name, approval_specs, copy_spec, user_by_id):
         )
         nodes.append(node)
 
-    if copy_spec and len(nodes) > 1:
-        last_node = nodes[-1]
-        if last_node.get("TYPE") == "simple":
-            last_node["CARBON_COPY"][0]["SENDTIME"] = "AGREE"
-            apply_workflow_target_to_selections(
-                last_node["CARBON_COPY"][0]["SELECTIONS"],
-                copy_spec.get("userIds") or [],
-                copy_spec.get("selectedRole"),
-                user_by_id,
-            )
+    end_node = workflow_end_node()
+    if copy_spec:
+        end_node["CARBON_COPY"][0]["SENDTIME"] = "AGREE"
+        apply_workflow_target_to_selections(
+            end_node["CARBON_COPY"][0]["SELECTIONS"],
+            copy_spec.get("userIds") or [],
+            copy_spec.get("selectedRole"),
+            user_by_id,
+        )
 
-    nodes.append(workflow_end_node())
+    nodes.append(end_node)
     return {
         "NAME": workflow_name,
         "BASIC": {"billRejectMode": "0"},
@@ -1778,6 +1831,8 @@ def main():
             "branch_skip": [],
             "default_model_ok": [],
             "default_model_fail": [],
+            "default_model_retry_ok": [],
+            "default_model_retry_fail": [],
             "ui_save_ok": [],
             "ui_save_warn": [],
             "ui_save_fail": [],
@@ -1987,12 +2042,16 @@ def main():
         df_wf_check = None
 
     if workflow_rows_present:
-        workflow_doc_names = {
+        doc_names_from_03 = {
             normalize_text(value)
-            for value in df_wf_check[workflow_name_col].tolist()
+            for value in df3_check[get_col(df3_check, "单据模板名称")].tolist()
             if normalize_text(value)
         }
-        doc_names_from_03 = set(df3_check[get_col(df3_check, "单据模板名称")].dropna().unique())
+        workflow_doc_names = {
+            resolve_workflow_template_name(value, doc_names_from_03)
+            for value in df_wf_check[workflow_name_col].tolist()
+            if resolve_workflow_template_name(value, doc_names_from_03)
+        }
 
         workflow_only = workflow_doc_names - doc_names_from_03
         if workflow_only:
@@ -2528,14 +2587,18 @@ def main():
             )
 
     # Step2.5
+    df3 = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
+    df3 = filter_rows_by_optional_flag(df3, "是否创建", ["单据分组（一级目录）", "单据模板名称"])
+    doc_template_names = {
+        normalize_text(value)
+        for value in df3[get_col(df3, "单据模板名称")].tolist()
+        if normalize_text(value)
+    }
+
     role_map_for_workflow = role_nodes_map(company_id, h, cache=api_cache, force_refresh=True)
     role_detail_cache = {}
     wfs = query_workflows(company_id, h)
-    workflow_by_doc = {
-        normalize_text(workflow.get("tpName")): workflow.get("id")
-        for workflow in wfs
-        if normalize_text(workflow.get("tpName")) and workflow.get("id")
-    }
+    workflow_by_doc = build_workflow_doc_map(wfs, doc_template_names)
     workflow_docs_defined = set()
     fallback_workflow_id = None
     fallback_workflow_name = None
@@ -2566,7 +2629,7 @@ def main():
             ].copy()
         copy_name_col = get_optional_col(df_wf, "抄送人")
         for _, row in df_wf.iterrows():
-            doc_name = normalize_text(row.get(workflow_name_col, ""))
+            doc_name = resolve_workflow_template_name(row.get(workflow_name_col, ""), doc_template_names)
             if not doc_name:
                 continue
             workflow_docs_defined.add(doc_name)
@@ -2673,13 +2736,7 @@ def main():
                 )
 
         wfs = query_workflows(company_id, h)
-        workflow_by_doc.update(
-            {
-                normalize_text(workflow.get("tpName")): workflow.get("id")
-                for workflow in wfs
-                if normalize_text(workflow.get("tpName")) and workflow.get("id")
-            }
-        )
+        workflow_by_doc.update(build_workflow_doc_map(wfs, doc_template_names))
         if not fallback_workflow_id and wfs:
             fallback_workflow_id = wfs[0].get("id")
             fallback_workflow_name = wfs[0].get("tpName")
@@ -2715,9 +2772,22 @@ def main():
     groups = existing_templates
     group_map = {g.get("name") or g.get("title"): g.get("id") for g in groups if (g.get("name") or g.get("title")) and g.get("id")}
     template_name_map = build_template_name_id_map(groups)
+    missing_template_names = sorted(name for name in doc_template_names if name not in template_name_map)
+    if missing_template_names:
+        try:
+            page_template_map = ui_template_name_id_map(preferred_browser=args.browser, reload_page=False)
+        except Exception as exc:
+            report["step3"]["default_model_fail"].append(
+                {
+                    "type": "template-tree-ui",
+                    "message": str(exc),
+                }
+            )
+        else:
+            for name in missing_template_names:
+                if page_template_map.get(name):
+                    template_name_map.setdefault(name, page_template_map[name])
 
-    df3 = read_sheet_with_header(xlsx, "03_单据表", "单据模板名称")
-    df3 = filter_rows_by_optional_flag(df3, "是否创建", ["单据分组（一级目录）", "单据模板名称"])
     df3[get_col(df3, "单据分组（一级目录）")] = df3[get_col(df3, "单据分组（一级目录）")].ffill()
 
     type_map = {"报销单": "EXPENSE", "借款单": "LOAN", "批量付款单": "PAYMENT", "申请单": "REQUISITION"}
@@ -2870,6 +2940,56 @@ def main():
                 merged["feeScopeFlag"] = True
 
             ur = update_bill_template(merged, h)
+            if not is_ok(ur) and uses_fallback_bill_model(default_bill_models.get(bill_type)):
+                try:
+                    refreshed_model = get_default_bill_model(
+                        bill_type,
+                        preferred_browser=args.browser,
+                        group_id=group_map.get(group_name) or 0,
+                        fresh_page=False,
+                    )
+                except Exception as exc:
+                    report["step3"]["default_model_retry_fail"].append(
+                        {"doc": doc_name, "type": bill_type, "message": str(exc)}
+                    )
+                else:
+                    if not uses_fallback_bill_model(refreshed_model):
+                        default_bill_models[bill_type] = refreshed_model
+                        refreshed_defaults = template_defaults_from_model(bill_type, refreshed_model or {})
+                        merged["applyRelateFlag"] = refreshed_defaults.get("applyRelateFlag", merged.get("applyRelateFlag", True))
+                        merged["applyRelateNecessary"] = refreshed_defaults.get(
+                            "applyRelateNecessary", merged.get("applyRelateNecessary", False)
+                        )
+                        merged["businessType"] = refreshed_defaults.get("businessType", merged.get("businessType", "PRIVATE"))
+                        merged["componentJson"] = refreshed_defaults.get("componentJson") or merged.get("componentJson") or []
+                        merged["feeScopeFlag"] = refreshed_defaults.get("feeScopeFlag", merged.get("feeScopeFlag", False))
+                        merged["icon"] = refreshed_defaults.get("icon", merged.get("icon", "md-pricetag"))
+                        merged["iconColor"] = refreshed_defaults.get("iconColor", merged.get("iconColor", "#4c7cc3"))
+                        merged["payFlag"] = refreshed_defaults.get("payFlag", merged.get("payFlag", True))
+                        merged["requestScope"] = refreshed_defaults.get("requestScope", merged.get("requestScope", False))
+                        for extra_key in [
+                            "applyContentType",
+                            "lessThanApplyAmount",
+                            "loanRelateFlag",
+                            "loanRelateNecessary",
+                            "loanRequestScope",
+                            "needRepayFlag",
+                            "refundDateFlag",
+                            "relatOnce",
+                        ]:
+                            if extra_key in refreshed_defaults:
+                                merged[extra_key] = refreshed_defaults[extra_key]
+                            else:
+                                merged.pop(extra_key, None)
+                        ur = update_bill_template(merged, h)
+                        report["step3"]["default_model_retry_ok"].append(
+                            {
+                                "doc": doc_name,
+                                "type": bill_type,
+                                "source": refreshed_model.get("_source", "browser"),
+                                "success": is_ok(ur),
+                            }
+                        )
             if is_ok(ur):
                 report["step3"]["ok"] += 1
             else:
